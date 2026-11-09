@@ -104,6 +104,12 @@ EOF
 EOF
 	for a in web sni; do
 		launchctl bootout "gui/$(id -u)/$LABEL.$a" 2>/dev/null || true
+		# bootout is asynchronous; wait until the old job is gone before loading the new one
+		i=0
+		while launchctl print "gui/$(id -u)/$LABEL.$a" >/dev/null 2>&1 && [ $i -lt 50 ]; do
+			sleep 0.2
+			i=$((i + 1))
+		done
 		launchctl bootstrap "gui/$(id -u)" "$AGENTS/$LABEL.$a.plist"
 	done
 	sleep 1
