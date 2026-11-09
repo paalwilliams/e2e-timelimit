@@ -16,11 +16,11 @@ from leechproxy import acl_helper, core, leechblock, webui  # noqa: E402
 MON_10 = dt.datetime(2026, 11, 9, 10, 0)  # a Monday
 
 
-def setup_lists(*lists):
-    core.save_config({"lists": list(lists)})
-    if os.path.exists(core.db_path()):
-        with core.db() as c:
-            c.execute("DELETE FROM usage"); c.execute("DELETE FROM hosts"); c.execute("DELETE FROM lbreports")
+def setup_lists(*lists, users=()):
+    core.save_config({"lists": list(lists), "users": list(users)})
+    with core.db() as c:
+        for t in ("usage2", "hosts2", "lbreports", "devices"):
+            c.execute(f"DELETE FROM {t}")
 
 
 class EngineTest(unittest.TestCase):
@@ -60,16 +60,19 @@ class EngineTest(unittest.TestCase):
         self.assertEqual((blocked, reason), (True, "limit"))
 
     def test_leechblock_report_counts(self):
-        setup_lists({"name": "yt", "domains": ["youtube.com"], "limit_minutes": 30, "leechblock_set": 2})
+        setup_lists({"name": "yt", "domains": ["youtube.com"], "limit_minutes": 30, "leechblock_set": 2},
+                    users=[{"id": "kid", "name": "Kid", "devices": [{"ip": "10.0.0.5"}, {"ip": "10.0.0.6"}]}])
         e = core.Engine()
+        kid = dict(ip="10.0.0.5")
         midnight = dt.datetime.combine(MON_10.date(), dt.time()).timestamp()
         core.record_leechblock_report("10.0.0.5", {"sets": [{"set": 2, "periodStart": midnight, "periodSecs": 1500}]}, MON_10)
-        self.assertFalse(e.check("youtube.com", MON_10)[0])
+        self.assertFalse(e.check("youtube.com", MON_10, **kid)[0])
         core.record_leechblock_report("10.0.0.6", {"sets": [{"set": 2, "periodStart": midnight, "periodSecs": 400}]}, MON_10)
-        self.assertEqual(e.check("youtube.com", MON_10)[2], "limit")  # 25 + 6 min across two browsers
+        self.assertEqual(e.check("youtube.com", MON_10, **kid)[2], "limit")  # 25 + 6 min across the kid's two browsers
+        self.assertFalse(e.check("youtube.com", MON_10, ip="10.0.0.99")[0])  # someone else isn't affected
         # A stale period (yesterday) doesn't count
         core.record_leechblock_report("10.0.0.6", {"sets": [{"set": 2, "periodStart": midnight - 86400, "periodSecs": 9999}]}, MON_10)
-        self.assertFalse(e.check("youtube.com", MON_10)[0])
+        self.assertFalse(e.check("youtube.com", MON_10, **kid)[0])
 
     def test_reload_on_change(self):
         setup_lists({"name": "a", "domains": ["a.com"]})
@@ -98,15 +101,50 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(l["domains"], ["reddit.com", "foo.org"])
 
 
+class UsersTest(unittest.TestCase):
+    USERS = [{"id": "alice", "name": "Alice", "devices": [{"label": "phone", "mac": "A4-83-E7-12-34-56"}]},
+             {"id": "bob", "name": "Bob", "devices": [{"label": "laptop", "ip": "192.168.1.30"}]}]
+
+    def test_list_for_specific_user(self):
+        setup_lists({"name": "games", "domains": ["roblox.com"], "users": ["bob"]}, users=self.USERS)
+        e = core.Engine()
+        self.assertTrue(e.check("roblox.com", MON_10, ip="192.168.1.30")[0])
+        self.assertFalse(e.check("roblox.com", MON_10, mac="a4:83:e7:12:34:56", ip="192.168.1.31")[0])
+        self.assertFalse(e.check("roblox.com", MON_10, ip="192.168.1.99")[0])  # unknown device
+
+    def test_mac_beats_ip_and_limits_are_per_user(self):
+        setup_lists({"name": "yt", "domains": ["youtube.com"], "limit_minutes": 1}, users=self.USERS)
+        e = core.Engine()
+        # Alice's phone on Bob's old IP is still Alice
+        self.assertFalse(e.check("youtube.com", MON_10, mac="a4:83:e7:12:34:56", ip="192.168.1.30")[0])
+        self.assertEqual(e.check("youtube.com", MON_10.replace(minute=1), mac="a4:83:e7:12:34:56")[2], "limit")
+        self.assertFalse(e.check("youtube.com", MON_10.replace(minute=1), ip="192.168.1.30")[0])  # Bob unaffected
+        # Unknown devices each get their own allowance
+        self.assertFalse(e.check("youtube.com", MON_10, ip="192.168.1.50")[0])
+        self.assertTrue(e.check("youtube.com", MON_10.replace(minute=2), ip="192.168.1.50")[0])
+        self.assertFalse(e.check("youtube.com", MON_10.replace(minute=2), ip="192.168.1.51")[0])
+
+    def test_validation(self):
+        with self.assertRaises(ValueError):
+            core.validate_config({"users": [{"name": "A", "devices": [{"ip": "1.2.3.4"}]},
+                                            {"name": "B", "devices": [{"ip": "1.2.3.4"}]}]})
+        with self.assertRaises(ValueError):
+            core.validate_user({"name": "A", "devices": [{"mac": "nope"}]})
+        cfg = core.validate_config({"users": [], "lists": [{"name": "x", "users": ["gone"]}]})
+        self.assertEqual(cfg["lists"][0]["users"], [])
+
+
 class HelperTest(unittest.TestCase):
     def test_protocol(self):
         setup_lists({"name": "social", "domains": ["reddit.com"]})
         e = core.Engine()
-        self.assertTrue(acl_helper.handle(e, "7 www.reddit.com 151.101.1.140").startswith("7 OK message="))
-        self.assertEqual(acl_helper.handle(e, "8 - www.reddit.com").split()[1], "OK")   # explicit CONNECT
-        self.assertEqual(acl_helper.handle(e, "9 - 151.101.1.140"), "9 ERR")            # intercepted, no SNI yet
-        self.assertEqual(acl_helper.handle(e, "1 example.com 1.2.3.4"), "1 ERR")
-        self.assertEqual(acl_helper.handle(e, "reddit.com -").split()[0], "OK")          # no concurrency
+        ip, mac = "192.168.1.20", "a4:83:e7:12:34:56"
+        self.assertTrue(acl_helper.handle(e, f"7 {ip} {mac} www.reddit.com 151.101.1.140").startswith("7 OK message="))
+        self.assertEqual(acl_helper.handle(e, f"8 {ip} - - www.reddit.com").split()[1], "OK")   # explicit CONNECT
+        self.assertEqual(acl_helper.handle(e, f"9 {ip} {mac} - 151.101.1.140"), "9 ERR")         # intercepted, no SNI yet
+        self.assertEqual(acl_helper.handle(e, f"1 {ip} - example.com 1.2.3.4"), "1 ERR")
+        self.assertEqual(acl_helper.handle(e, f"{ip} - reddit.com -").split()[0], "OK")         # no concurrency
+        self.assertEqual({d["mac"] for d in core.recent_devices()}, {mac, None})
 
 
 class LeechBlockImportTest(unittest.TestCase):
@@ -175,7 +213,12 @@ class WebTest(unittest.TestCase):
         setup_lists()
         l = self.req("POST", "/api/lists", {"name": "Test", "domains": ["a.com"]})["list"]
         st = self.req("GET", "/api/state")
-        self.assertEqual(st["lists"][0]["status"]["blocked"], True)
+        self.assertEqual(st["lists"][0]["status"][0]["blocked"], True)
+        u = self.req("POST", "/api/users", {"name": "Kid", "devices": [{"ip": "127.0.0.1"}]})["user"]
+        self.req("PUT", f"/api/users/{u['id']}", {"name": "Kid", "devices": [{"ip": "127.0.0.1"}, {"mac": "aa:bb:cc:dd:ee:ff"}]})
+        st = self.req("GET", "/api/state")
+        self.assertEqual([x["label"] for x in st["lists"][0]["status"]], ["Kid"])
+        self.assertEqual(len(st["users"][0]["devices"]), 2)
         self.req("PUT", f"/api/lists/{l['id']}", {"name": "Test2", "domains": ["a.com", "b.com"], "leechblock_set": 4})
         self.assertEqual(self.req("GET", f"/leechblock/sites/{l['id']}"), "a.com\nb.com\n")
         self.assertEqual(self.req("GET", "/leechblock/set/4"), "a.com\nb.com\n")
@@ -186,6 +229,8 @@ class WebTest(unittest.TestCase):
         self.req("POST", "/api/leechblock/report", {"sets": [{"set": 1, "periodStart": 0, "periodSecs": 5}]})
         self.assertEqual(len(self.req("GET", "/api/state")["leechblock_reports"]), 1)
         self.req("DELETE", f"/api/lists/{l['id']}")
+        self.req("DELETE", f"/api/users/{u['id']}")
+        self.assertEqual(self.req("GET", "/api/state")["users"], [])
         self.assertEqual(len(self.req("GET", "/api/state")["lists"]), 2)
         self.assertIn("<title>LeechProxy</title>", self.req("GET", "/"))
         self.assertIn("&lt;x&gt;", self.req("GET", "/blocked?host=%3Cx%3E"))

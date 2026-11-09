@@ -18,7 +18,7 @@ cat > "$RUN/squid.conf" <<EOF
 http_port 127.0.0.1:$PORT
 
 external_acl_type leechproxy ttl=0 negative_ttl=0 children-max=1 children-startup=1 concurrency=50 \\
-    %ssl::>sni %DST \\
+    %SRC %SRCEUI48 %ssl::>sni %DST \\
     /usr/bin/env LEECHPROXY_DATA=$DATA PYTHONPATH=$HERE $PY -m leechproxy.acl_helper
 acl leech_blocked external leechproxy
 

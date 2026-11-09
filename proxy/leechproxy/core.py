@@ -1,9 +1,16 @@
 """Core logic shared by the Squid ACL helper and the web UI.
 
-Config lives in a JSON file (see DEFAULT_CONFIG); usage lives in SQLite.
-Time is counted in "active minutes": a site set accrues one minute for every
-distinct wall-clock minute in which the proxy saw a new request/connection to
-one of its hosts. This is a traffic-based approximation, not focused-tab time.
+Config lives in a JSON file; usage lives in SQLite.
+
+People ("users") own devices, identified by MAC address (preferred: survives DHCP
+changes; only visible when Squid runs on the router or same LAN segment) or IP.
+Each list applies to everyone or to selected users, and every user has their own
+daily allowance. Devices that don't belong to a user are tracked individually.
+
+Time is counted in "active minutes": a (list, user) pair accrues one minute for
+every distinct wall-clock minute in which the proxy saw a new request/connection
+to one of the list's hosts from that user's devices. This is a traffic-based
+approximation, not focused-tab time.
 """
 
 import datetime as dt
@@ -32,8 +39,9 @@ DEFAULT_LIST = {
     "allow": [],          # exceptions that are never blocked/counted
     "sources": [],        # URLs of hosts-format or domain-per-line blocklists
     "periods": [],        # ["0900-1200", "1300-1700"]; empty = no time-window blocking
-    "limit_minutes": None,  # daily allowance; None = no limit
+    "limit_minutes": None,  # daily allowance per user; None = no limit
     "days": DAYS[:],      # days on which the rules apply
+    "users": [],          # user ids this list applies to; empty = everyone (incl. unknown devices)
     "leechblock_set": None,  # LeechBlock block set number whose reported time also counts
     "imported": False,    # created by LeechBlock import (re-import replaces it)
 }
@@ -55,6 +63,7 @@ def db_path():
 
 _PERIOD_RE = re.compile(r"^(\d{2})(\d{2})-(\d{2})(\d{2})$")
 _DOMAIN_RE = re.compile(r"^(\*\.)?([a-z0-9_-]+\.)*[a-z0-9_-]+$")
+_MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
 
 
 def normalize_domain(d):
@@ -69,7 +78,47 @@ def normalize_domain(d):
     return d
 
 
-def validate_list(raw):
+def normalize_mac(m):
+    m = (m or "").strip().lower().replace("-", ":")
+    if re.fullmatch(r"[0-9a-f]{12}", m):
+        m = ":".join(m[i:i + 2] for i in range(0, 12, 2))
+    # Squid may print single-digit octets without padding
+    if ":" in m:
+        m = ":".join(p.zfill(2) for p in m.split(":"))
+    return m
+
+
+def normalize_ip(ip):
+    ip = (ip or "").strip().strip("[]")
+    try:
+        a = ipaddress.ip_address(ip)
+        if a.version == 6 and a.ipv4_mapped:
+            a = a.ipv4_mapped
+        return str(a)
+    except ValueError:
+        return ""
+
+
+def validate_user(raw):
+    out = {"id": str(raw.get("id") or uuid.uuid4().hex[:12]),
+           "name": str(raw.get("name") or "").strip()[:100]}
+    if not out["name"]:
+        raise ValueError("user needs a name")
+    devices = []
+    for d in raw.get("devices") or []:
+        mac, ip = normalize_mac(d.get("mac")), normalize_ip(d.get("ip"))
+        if d.get("mac") and not _MAC_RE.match(mac):
+            raise ValueError(f"invalid MAC address: {d.get('mac')!r}")
+        if d.get("ip") and not ip:
+            raise ValueError(f"invalid IP address: {d.get('ip')!r}")
+        if not mac and not ip:
+            continue
+        devices.append({"label": str(d.get("label") or "").strip()[:60], "mac": mac or None, "ip": ip or None})
+    out["devices"] = devices
+    return out
+
+
+def validate_list(raw, user_ids=None):
     """Return a cleaned list dict or raise ValueError."""
     out = dict(DEFAULT_LIST)
     out["id"] = str(raw.get("id") or uuid.uuid4().hex[:12])
@@ -126,6 +175,11 @@ def validate_list(raw):
     days = DAYS if days is None else [d for d in days if d in DAYS]
     out["days"] = [d for d in DAYS if d in days]
 
+    users = [str(u) for u in raw.get("users") or []]
+    if user_ids is not None:
+        users = [u for u in users if u in user_ids]  # drop references to deleted users
+    out["users"] = list(dict.fromkeys(users))
+
     lbs = raw.get("leechblock_set")
     if lbs in (None, "", 0, "0"):
         out["leechblock_set"] = None
@@ -137,19 +191,34 @@ def validate_list(raw):
     return out
 
 
+def validate_config(cfg):
+    users = [validate_user(u) for u in cfg.get("users", [])]
+    seen = {}
+    for u in users:
+        for d in u["devices"]:
+            for key in ("mac", "ip"):
+                if d[key]:
+                    other = seen.setdefault((key, d[key]), u["name"])
+                    if other != u["name"]:
+                        raise ValueError(f"{key.upper()} {d[key]} is assigned to both {other} and {u['name']}")
+    ids = {u["id"] for u in users}
+    return {"users": users, "lists": [validate_list(l, ids) for l in cfg.get("lists", [])]}
+
+
 def load_config():
     try:
         with open(config_path()) as f:
             cfg = json.load(f)
     except FileNotFoundError:
-        cfg = {"lists": []}
+        cfg = {}
     cfg.setdefault("lists", [])
+    cfg.setdefault("users", [])
     return cfg
 
 
 def save_config(cfg):
     os.makedirs(DATA_DIR, exist_ok=True)
-    cfg = {"lists": [validate_list(l) for l in cfg.get("lists", [])]}
+    cfg = validate_config(cfg)
     fd, tmp = tempfile.mkstemp(dir=DATA_DIR, prefix=".config.")
     with os.fdopen(fd, "w") as f:
         json.dump(cfg, f, indent=2)
@@ -210,6 +279,9 @@ def source_info(url):
 
 
 # ------------------------------------------------------------------ usage DB
+#
+# "who" identifies whose allowance is used: "u:<user id>" for a known user,
+# "d:<mac or ip>" for a device that isn't assigned to anyone.
 
 _local = threading.local()
 
@@ -220,39 +292,63 @@ def db():
         os.makedirs(DATA_DIR, exist_ok=True)
         conn = sqlite3.connect(db_path(), timeout=5)
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS usage (list_id TEXT, day TEXT, minute INTEGER,"
-            " PRIMARY KEY (list_id, day, minute)) WITHOUT ROWID"
-        )
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS hosts (host TEXT, day TEXT, minute INTEGER,"
-            " PRIMARY KEY (host, day, minute)) WITHOUT ROWID"
-        )
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS lbreports (client TEXT, lbset INTEGER, day TEXT,"
-            " name TEXT, secs INTEGER, updated INTEGER, PRIMARY KEY (client, lbset, day)) WITHOUT ROWID"
-        )
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS usage2 (list_id TEXT, who TEXT, day TEXT, minute INTEGER,
+                PRIMARY KEY (list_id, who, day, minute)) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS hosts2 (host TEXT, who TEXT, day TEXT, minute INTEGER,
+                PRIMARY KEY (host, who, day, minute)) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS devices (mac TEXT, ip TEXT, last_seen INTEGER,
+                PRIMARY KEY (mac, ip)) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS lbreports (client TEXT, lbset INTEGER, day TEXT,
+                name TEXT, secs INTEGER, updated INTEGER, PRIMARY KEY (client, lbset, day)) WITHOUT ROWID;
+        """)
         _local.conn = conn
     return conn
 
 
-def proxy_minutes(list_id, day):
-    row = db().execute("SELECT COUNT(*) FROM usage WHERE list_id=? AND day=?", (list_id, day)).fetchone()
+def proxy_minutes(list_id, who, day):
+    row = db().execute("SELECT COUNT(*) FROM usage2 WHERE list_id=? AND who=? AND day=?",
+                       (list_id, who, day)).fetchone()
     return row[0]
 
 
-def leechblock_minutes(lbset, day):
-    """Focused time reported by LeechBlock browsers for a set today, summed over browsers."""
-    if not lbset:
-        return 0
-    row = db().execute("SELECT COALESCE(SUM(secs),0) FROM lbreports WHERE lbset=? AND day=?", (lbset, day)).fetchone()
-    return row[0] // 60
+def record(list_ids, host, who, mac, ip, now):
+    day = now.strftime("%Y-%m-%d")
+    minute = now.hour * 60 + now.minute
+    c = db()
+    with c:
+        for lid in list_ids:
+            c.execute("INSERT OR IGNORE INTO usage2 VALUES (?,?,?,?)", (lid, who, day, minute))
+        c.execute("INSERT OR IGNORE INTO hosts2 VALUES (?,?,?,?)", (host, who, day, minute))
 
 
-def used_minutes(l, day):
-    """Proxy-observed minutes, or LeechBlock-reported minutes if larger.
-    (max rather than sum: the same browsing usually shows up in both.)"""
-    return max(proxy_minutes(l["id"], day), leechblock_minutes(l.get("leechblock_set"), day))
+def note_device(mac, ip, now_ts=None):
+    """Remember devices seen recently so the UI can offer to assign them."""
+    if not (mac or ip):
+        return
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO devices VALUES (?,?,?)", (mac or "", ip or "", int(now_ts or time.time())))
+
+
+def recent_devices(since_secs=7 * 86400):
+    rows = db().execute("SELECT mac, ip, last_seen FROM devices WHERE last_seen > ? ORDER BY last_seen DESC",
+                        (int(time.time()) - since_secs,)).fetchall()
+    return [{"mac": m or None, "ip": i or None, "last_seen": t} for m, i, t in rows]
+
+
+def host_stats(day, limit=50):
+    return db().execute(
+        "SELECT host, who, COUNT(*) AS m FROM hosts2 WHERE day=? GROUP BY host, who ORDER BY m DESC LIMIT ?",
+        (day, limit),
+    ).fetchall()
+
+
+def reset_usage(list_id, day, who=None):
+    with db() as c:
+        if who:
+            c.execute("DELETE FROM usage2 WHERE list_id=? AND day=? AND who=?", (list_id, day, who))
+        else:
+            c.execute("DELETE FROM usage2 WHERE list_id=? AND day=?", (list_id, day))
 
 
 def record_leechblock_report(client, payload, now=None):
@@ -275,7 +371,7 @@ def record_leechblock_report(client, payload, now=None):
                 secs = 0
             c.execute(
                 "INSERT OR REPLACE INTO lbreports VALUES (?,?,?,?,?,?)",
-                (client, lbset, day, str(s.get("name") or "")[:100], max(0, secs), int(time.time())),
+                (normalize_ip(client) or client, lbset, day, str(s.get("name") or "")[:100], max(0, secs), int(time.time())),
             )
             count += 1
     return count
@@ -286,28 +382,6 @@ def leechblock_reports(day):
         "SELECT client, lbset, name, secs, updated FROM lbreports WHERE day=? ORDER BY lbset, client", (day,)
     ).fetchall()
     return [dict(zip(("client", "set", "name", "secs", "updated"), r)) for r in rows]
-
-
-def record(list_ids, host, now):
-    day = now.strftime("%Y-%m-%d")
-    minute = now.hour * 60 + now.minute
-    c = db()
-    with c:
-        for lid in list_ids:
-            c.execute("INSERT OR IGNORE INTO usage VALUES (?,?,?)", (lid, day, minute))
-        c.execute("INSERT OR IGNORE INTO hosts VALUES (?,?,?)", (host, day, minute))
-
-
-def host_stats(day, limit=50):
-    return db().execute(
-        "SELECT host, COUNT(*) AS m FROM hosts WHERE day=? GROUP BY host ORDER BY m DESC LIMIT ?",
-        (day, limit),
-    ).fetchall()
-
-
-def reset_usage(list_id, day):
-    with db() as c:
-        c.execute("DELETE FROM usage WHERE list_id=? AND day=?", (list_id, day))
 
 
 # ----------------------------------------------------------------- matching
@@ -338,8 +412,12 @@ class Engine:
     def __init__(self):
         self._stamp = None
         self.lists = []
+        self.users = []
         self.index = {}   # domain -> set(list_id) for blocking
         self.allow = {}   # domain -> set(list_id) for exceptions
+        self.by_mac = {}  # mac -> user
+        self.by_ip = {}   # ip -> user
+        self._seen = {}   # (mac, ip) -> last time written to devices table
 
     def _files_stamp(self):
         stamps = []
@@ -354,8 +432,10 @@ class Engine:
         stamp = self._files_stamp()
         if stamp == self._stamp:
             return
-        cfg = load_config()
-        self.lists = [validate_list(l) for l in cfg["lists"]]
+        cfg = validate_config(load_config())
+        self.users, self.lists = cfg["users"], cfg["lists"]
+        self.by_mac = {d["mac"]: u for u in self.users for d in u["devices"] if d["mac"]}
+        self.by_ip = {d["ip"]: u for u in self.users for d in u["devices"] if d["ip"]}
         index, allow = {}, {}
         for l in self.lists:
             if not l["enabled"]:
@@ -374,17 +454,46 @@ class Engine:
         self.index, self.allow = index, allow
         self._stamp = self._files_stamp()  # include newly referenced source files
 
-    def matching_lists(self, host):
+    def identify(self, mac=None, ip=None):
+        """Return (user or None, who-key)."""
+        mac, ip = normalize_mac(mac) if mac and mac != "-" else "", normalize_ip(ip)
+        user = self.by_mac.get(mac) if mac else None
+        user = user or (self.by_ip.get(ip) if ip else None)
+        if user:
+            return user, "u:" + user["id"]
+        return None, "d:" + (mac or ip or "unknown")
+
+    def ips_of(self, who):
+        """IPs whose LeechBlock reports count for this who-key."""
+        if who.startswith("u:"):
+            return [ip for ip, u in self.by_ip.items() if u["id"] == who[2:]]
+        dev = who[2:]
+        return [dev] if normalize_ip(dev) else []
+
+    def matching_lists(self, host, user):
         hit, exc = set(), set()
         for s in host_suffixes(host):
             hit |= self.index.get(s, set())
             exc |= self.allow.get(s, set())
-        return [l for l in self.lists if l["id"] in hit and l["id"] not in exc]
+        return [l for l in self.lists if l["id"] in hit and l["id"] not in exc
+                and (not l["users"] or (user and user["id"] in l["users"]))]
 
-    def list_status(self, l, now):
+    def used_minutes(self, l, who, day):
+        """Proxy-observed minutes, or LeechBlock-reported minutes if larger.
+        (max rather than sum: the same browsing usually shows up in both.)"""
+        used = proxy_minutes(l["id"], who, day)
+        ips = self.ips_of(who)
+        if l["leechblock_set"] and ips:
+            q = "SELECT COALESCE(SUM(secs),0) FROM lbreports WHERE lbset=? AND day=? AND client IN (%s)" % \
+                ",".join("?" * len(ips))
+            secs = db().execute(q, (l["leechblock_set"], day, *ips)).fetchone()[0]
+            used = max(used, secs // 60)
+        return used
+
+    def list_status(self, l, who, now):
         """Return (blocked: bool, reason: str|None, used_minutes: int)."""
         day = now.strftime("%Y-%m-%d")
-        used = used_minutes(l, day)
+        used = self.used_minutes(l, who, day)
         if not l["enabled"] or DAYS[now.weekday()] not in l["days"]:
             return False, None, used
         has_rules = bool(l["periods"]) or l["limit_minutes"] is not None
@@ -396,28 +505,31 @@ class Engine:
             return True, "limit", used
         return False, None, used
 
-    def check(self, host, now=None, count=True):
+    def check(self, host, now=None, count=True, mac=None, ip=None):
         """Decide for one request. Returns (blocked, list_name, reason)."""
         now = now or dt.datetime.now()
         host = normalize_domain(host or "")
-        if not host or host == "-" or _is_ip(host):
-            return False, None, None
         self.maybe_reload()
-        matches = self.matching_lists(host)
+        user, who = self.identify(mac, ip)
+        if count:
+            self._note(mac, ip, now)
+        if not host or host == "-" or normalize_ip(host):
+            return False, None, None
+        matches = self.matching_lists(host, user)
         if not matches:
             return False, None, None
         for l in matches:
-            blocked, reason, _ = self.list_status(l, now)
+            blocked, reason, _ = self.list_status(l, who, now)
             if blocked:
                 return True, l["name"], reason
         if count:
-            record([l["id"] for l in matches], host, now)
+            record([l["id"] for l in matches], host, who, mac, ip, now)
         return False, None, None
 
-
-def _is_ip(s):
-    try:
-        ipaddress.ip_address(s.strip("[]"))
-        return True
-    except ValueError:
-        return False
+    def _note(self, mac, ip, now):
+        mac = normalize_mac(mac) if mac and mac != "-" else ""
+        ip = normalize_ip(ip)
+        ts = now.timestamp()
+        if ts - self._seen.get((mac, ip), 0) > 60:  # write at most once a minute per device
+            self._seen[(mac, ip)] = ts
+            note_device(mac, ip, ts)

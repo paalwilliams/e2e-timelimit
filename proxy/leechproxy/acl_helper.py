@@ -2,10 +2,12 @@
 
 squid.conf:
   external_acl_type leechproxy ttl=0 negative_ttl=0 children-max=1 concurrency=50 \
-      %ssl::>sni %DST /usr/bin/python3 -m leechproxy.acl_helper
+      %SRC %SRCEUI48 %ssl::>sni %DST /usr/bin/python3 -m leechproxy.acl_helper
   acl leech_blocked external leechproxy
 
-Input lines:  "<channel-id> <sni> <dst>"   (values are %-encoded, "-" when unknown)
+Input lines:  "<channel-id> <client-ip> <client-mac> <sni> <dst>"
+              (values are %-encoded, "-" when unknown; the MAC is only known when
+              Squid shares a LAN segment with the client, e.g. on the router)
 Output lines: "<channel-id> OK message=..."  -> ACL matches -> request is blocked
               "<channel-id> ERR"             -> allowed
 The helper must never crash or stall Squid, so all errors fail open (ERR).
@@ -20,15 +22,14 @@ from .core import Engine
 def handle(engine, line):
     parts = line.split()
     chan = ""
-    if len(parts) >= 3:  # concurrency>0: leading channel ID
+    if len(parts) >= 5:  # concurrency>0: leading channel ID
         chan, parts = parts[0], parts[1:]
-    vals = [urllib.parse.unquote(p) for p in parts]
-    sni = vals[0] if vals else "-"
-    dst = vals[1] if len(vals) > 1 else "-"
+    vals = [urllib.parse.unquote(p) for p in parts] + ["-"] * 4
+    ip, mac, sni, dst = vals[:4]
     host = sni if sni not in ("", "-") else dst
     prefix = f"{chan} " if chan else ""
     try:
-        blocked, name, reason = engine.check(host)
+        blocked, name, reason = engine.check(host, mac=mac, ip=ip)
     except Exception as e:  # fail open
         sys.stderr.write(f"leechproxy: error checking {host!r}: {e}\n")
         return prefix + "ERR"

@@ -59,6 +59,8 @@ dialog::backdrop { background: rgb(0 0 0 / .4); }
 .msg.err { background: color-mix(in srgb, var(--danger) 14%, transparent); }
 .msg.info { background: color-mix(in srgb, var(--accent) 14%, transparent); }
 .empty { text-align: center; padding: 28px; color: var(--muted); }
+.who { margin-top: 10px; }
+select { font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--input); color: var(--fg); }
 </style>
 </head>
 <body>
@@ -75,6 +77,13 @@ dialog::backdrop { background: rgb(0 0 0 / .4); }
     <button id="importBtn">Import from LeechBlock…</button>
     <button class="primary" id="addBtn">Add list</button></h2>
   <div id="lists"></div>
+
+  <h2 class="row"><span class="grow">People</span><button id="addUserBtn">Add person</button></h2>
+  <p class="muted" style="margin-top:-4px"><small>Each person's devices are identified by MAC address (best: stays the same when
+    the IP changes, but only visible when the proxy runs on the router) or by IP address. Phones use a private MAC per
+    Wi-Fi network, which is stable on your network.</small></p>
+  <div id="users"></div>
+  <div id="unassigned"></div>
 
   <h2>LeechBlock browsers</h2>
   <div class="card">
@@ -113,6 +122,10 @@ dialog::backdrop { background: rgb(0 0 0 / .4); }
       <div style="font-size:.88rem;font-weight:500;margin-bottom:4px">Active on</div>
       <div class="days" id="daysBox"></div>
     </div>
+    <div>
+      <div style="font-size:.88rem;font-weight:500;margin-bottom:4px">Applies to <small class="muted">none selected = everyone, including unassigned devices; each person has their own daily limit</small></div>
+      <div class="days" id="usersBox"></div>
+    </div>
     <label>Linked LeechBlock set number <small class="muted">optional; adds that set's reported focused time</small>
       <input type="number" name="leechblock_set" min="1" max="99" style="max-width:120px"></label>
     <p class="muted" style="margin:0"><small>No periods and no limit = blocked all day on the selected days.
@@ -121,6 +134,21 @@ dialog::backdrop { background: rgb(0 0 0 / .4); }
     <div class="row" style="justify-content:flex-end">
       <button type="button" class="danger" id="deleteBtn" style="margin-right:auto">Delete</button>
       <button type="button" id="cancelBtn">Cancel</button>
+      <button type="submit" class="primary">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="userDlg">
+  <form id="userForm" method="dialog">
+    <h2 style="margin:0" id="userTitle">Person</h2>
+    <label>Name <input type="text" name="name" required></label>
+    <label>Devices <small class="muted">one per line: <code>label, MAC or IP</code>, e.g. <code>phone, a4:83:e7:12:34:56</code></small>
+      <textarea name="devices" placeholder="laptop, 192.168.1.23&#10;phone, a4:83:e7:12:34:56"></textarea></label>
+    <div id="userErr"></div>
+    <div class="row" style="justify-content:flex-end">
+      <button type="button" class="danger" id="userDelete" style="margin-right:auto">Delete</button>
+      <button type="button" id="userCancel">Cancel</button>
       <button type="submit" class="primary">Save</button>
     </div>
   </form>
@@ -172,10 +200,12 @@ function render() {
   $("#reportUrl").textContent = base + "/api/leechblock/report";
   $("#setUrl").textContent = base + "/leechblock/set/$S";
 
+  const userName = id => (S.users.find(u => u.id === id) || {}).name || "?";
   $("#lists").innerHTML = S.lists.length ? S.lists.map(l => {
-    const st = l.status, lim = l.limit_minutes;
+    const lim = l.limit_minutes;
+    const nBlocked = l.status.filter(s => s.blocked).length;
     const pill = !l.enabled ? `<span class="pill off">disabled</span>`
-      : st.blocked ? `<span class="pill blocked">blocked · ${esc(st.reason)}</span>`
+      : nBlocked ? `<span class="pill blocked">blocked for ${nBlocked}/${l.status.length}</span>`
       : `<span class="pill ok">allowed</span>`;
     const nSrc = l.source_info.reduce((a, s) => a + s.domains, 0);
     const parts = [];
@@ -187,18 +217,41 @@ function render() {
     if (!l.periods.length && lim == null) rules.push("always blocked");
     if (l.days.length < 7) rules.push(l.days.join(" "));
     if (l.leechblock_set) rules.push(`LeechBlock set ${l.leechblock_set}`);
-    const pct = lim ? Math.min(100, 100 * st.used_minutes / lim) : 0;
+    rules.push(l.users.length ? "for " + l.users.map(userName).join(", ") : "for everyone");
+    const rows = l.status.map(st => {
+      const pct = lim ? Math.min(100, 100 * st.used_minutes / lim) : 0;
+      return `<div class="who">
+        <div class="row" style="font-size:.88rem"><span class="grow">${esc(st.label)}</span>
+          <span class="muted">${fmtMin(st.used_minutes)}${lim ? " / " + fmtMin(lim) : ""}</span>
+          ${st.blocked ? `<span class="pill blocked">blocked · ${esc(st.reason)}</span>` : ""}
+          ${st.proxy_minutes ? `<button data-reset="${l.id}" data-who="${esc(st.who)}" style="padding:1px 8px;font-size:.8rem">reset</button>` : ""}</div>
+        ${lim ? `<div class="bar ${pct>=100?"over":""}"><div style="width:${pct}%"></div></div>` : ""}
+      </div>`;
+    }).join("");
     return `<div class="card">
       <div class="row"><span class="name grow">${esc(l.name)}</span>${pill}
         ${l.sources.length ? `<button data-refresh="${l.id}">Refresh</button>` : ""}
         <button data-edit="${l.id}">Edit</button></div>
       <div class="meta">${parts.join(" · ") || "empty"}</div>
-      <div class="meta">${esc(rules.join(" · "))} · used today ${fmtMin(st.used_minutes)}
-        <small>(proxy ${fmtMin(st.proxy_minutes)}${l.leechblock_set ? `, LeechBlock ${fmtMin(st.leechblock_minutes)}` : ""})</small>
-        ${st.proxy_minutes ? `<button data-reset="${l.id}" style="padding:1px 8px;font-size:.8rem">reset</button>` : ""}</div>
-      ${lim ? `<div class="bar ${pct>=100?"over":""}"><div style="width:${pct}%"></div></div>` : ""}
+      <div class="meta">${esc(rules.join(" · "))}</div>
+      ${rows}
     </div>`;
   }).join("") : `<div class="card empty">No lists yet. Add one, or import your LeechBlock block sets.</div>`;
+
+  $("#users").innerHTML = S.users.length ? S.users.map(u => `<div class="card"><div class="row">
+      <span class="name grow">${esc(u.name)}</span><button data-user="${u.id}">Edit</button></div>
+      <div class="meta">${u.devices.length ? u.devices.map(d => esc([d.label, d.mac, d.ip].filter(Boolean).join(" · "))).join("<br>") : "no devices"}</div>
+    </div>`).join("")
+    : `<div class="card empty">No people yet. Without people, every list applies to every device.</div>`;
+
+  const ua = S.unassigned_devices;
+  $("#unassigned").innerHTML = ua.length && S.users.length ? `<div class="card"><div class="name" style="margin-bottom:6px">Unassigned devices seen recently</div>
+    <table><tr><th>MAC</th><th>IP</th><th>Last seen</th><th></th></tr>
+    ${ua.map((d, i) => `<tr><td>${esc(d.mac || "–")}</td><td>${esc(d.ip || "–")}</td>
+      <td>${new Date(d.last_seen*1000).toLocaleString()}</td>
+      <td><select data-assign="${i}"><option value="">Assign to…</option>
+        ${S.users.map(u => `<option value="${u.id}">${esc(u.name)}</option>`).join("")}</select></td></tr>`).join("")}
+    </table></div>` : "";
 
   const rep = S.leechblock_reports;
   $("#reports").innerHTML = rep.length ? `<table><tr><th>Browser</th><th>Set</th><th>Name</th><th class="num">Today</th><th>Last report</th></tr>
@@ -206,8 +259,8 @@ function render() {
       <td class="num">${fmtMin(Math.floor(r.secs/60))}</td><td>${new Date(r.updated*1000).toLocaleTimeString()}</td></tr>`).join("")}</table>`
     : `<p class="muted" style="margin-bottom:0">No reports from LeechBlock today.</p>`;
 
-  $("#hosts").innerHTML = S.hosts.length ? `<table><tr><th>Host</th><th class="num">Active minutes</th></tr>
-    ${S.hosts.map(h => `<tr><td>${esc(h.host)}</td><td class="num">${fmtMin(h.minutes)}</td></tr>`).join("")}</table>`
+  $("#hosts").innerHTML = S.hosts.length ? `<table><tr><th>Host</th><th>Who</th><th class="num">Active minutes</th></tr>
+    ${S.hosts.map(h => `<tr><td>${esc(h.host)}</td><td>${esc(h.who)}</td><td class="num">${fmtMin(h.minutes)}</td></tr>`).join("")}</table>`
     : `<p class="muted" style="margin:0">Nothing counted yet today. Only hosts in a list are tracked.</p>`;
 }
 
@@ -227,6 +280,10 @@ function openEdit(l) {
   f.leechblock_set.value = l?.leechblock_set ?? "";
   const days = l?.days ?? DAYS;
   $("#daysBox").innerHTML = DAYS.map(d => `<label><input type="checkbox" value="${d}" ${days.includes(d)?"checked":""}>${d}</label>`).join("");
+  const lu = l?.users ?? [];
+  $("#usersBox").innerHTML = S.users.length
+    ? S.users.map(u => `<label><input type="checkbox" value="${u.id}" ${lu.includes(u.id)?"checked":""}>${esc(u.name)}</label>`).join("")
+    : `<span class="muted"><small>Add people below to target specific people.</small></span>`;
   $("#deleteBtn").hidden = !l;
   $("#editErr").innerHTML = "";
   $("#editDlg").showModal();
@@ -242,6 +299,7 @@ $("#editForm").addEventListener("submit", async ev => {
     periods: lines(f.periods.value), limit_minutes: f.limit_minutes.value || null,
     leechblock_set: f.leechblock_set.value || null,
     days: [...$("#daysBox").querySelectorAll("input:checked")].map(i => i.value),
+    users: [...$("#usersBox").querySelectorAll("input:checked")].map(i => i.value),
   };
   delete body.status; delete body.source_info;
   try {
@@ -274,8 +332,59 @@ $("#lists").addEventListener("click", async ev => {
     load();
   }
   if (b.dataset.reset && confirm("Reset today's proxy-counted time for this list?")) {
-    await api("POST", `/api/lists/${b.dataset.reset}/reset`); load();
+    await api("POST", `/api/lists/${b.dataset.reset}/reset`, { who: b.dataset.who }); load();
   }
+});
+
+// ---- people
+let editingUser = null;
+function openUser(u) {
+  editingUser = u;
+  const f = $("#userForm");
+  $("#userTitle").textContent = u ? "Edit person" : "New person";
+  f.name.value = u?.name ?? "";
+  f.devices.value = (u?.devices ?? []).map(d => [d.label, d.mac || d.ip].filter(Boolean).join(", ")).join("\n");
+  $("#userDelete").hidden = !u;
+  $("#userErr").innerHTML = "";
+  $("#userDlg").showModal();
+}
+function parseDevices(text) {
+  return text.split("\n").map(s => s.trim()).filter(Boolean).map(line => {
+    const parts = line.split(",").map(s => s.trim());
+    const addr = parts.pop(), label = parts.join(", ");
+    return /^[0-9a-f]{2}([:-][0-9a-f]{2}){5}$|^[0-9a-f]{12}$/i.test(addr) ? { label, mac: addr } : { label, ip: addr };
+  });
+}
+async function saveUser(u) {
+  return u.id ? api("PUT", "/api/users/" + u.id, u) : api("POST", "/api/users", u);
+}
+$("#userForm").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const f = ev.target;
+  try {
+    await saveUser({ ...(editingUser ?? {}), name: f.name.value, devices: parseDevices(f.devices.value) });
+    $("#userDlg").close(); load();
+  } catch (e) { $("#userErr").innerHTML = `<div class="msg err">${esc(e.message)}</div>`; }
+});
+$("#userCancel").onclick = () => $("#userDlg").close();
+$("#userDelete").onclick = async () => {
+  if (!editingUser || !confirm(`Delete ${editingUser.name}? Their devices become unassigned.`)) return;
+  await api("DELETE", "/api/users/" + editingUser.id); $("#userDlg").close(); load();
+};
+$("#addUserBtn").onclick = () => openUser(null);
+$("#users").addEventListener("click", ev => {
+  const b = ev.target.closest("button[data-user]");
+  if (b) openUser(S.users.find(u => u.id === b.dataset.user));
+});
+$("#unassigned").addEventListener("change", async ev => {
+  const sel = ev.target.closest("select[data-assign]");
+  if (!sel || !sel.value) return;
+  const d = S.unassigned_devices[+sel.dataset.assign];
+  const u = S.users.find(x => x.id === sel.value);
+  const dev = d.mac ? { label: d.ip || "", mac: d.mac } : { label: "", ip: d.ip };
+  try { await saveUser({ ...u, devices: [...u.devices, dev] }); flash(`Assigned to ${u.name}.`); }
+  catch (e) { flash(e.message, "err"); }
+  load();
 });
 
 $("#importBtn").onclick = () => { $("#importErr").innerHTML = ""; $("#importText").value = ""; $("#importFile").value = ""; $("#importDlg").showModal(); };

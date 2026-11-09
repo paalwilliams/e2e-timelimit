@@ -38,29 +38,58 @@ _engine = core.Engine()
 PASSWORD = None
 
 
+def _who_label(who, users):
+    if who.startswith("u:"):
+        return users.get(who[2:], {}).get("name", "deleted user")
+    return "unassigned device " + who[2:]
+
+
 def state():
     now = dt.datetime.now()
     day = now.strftime("%Y-%m-%d")
-    cfg = core.load_config()
+    _engine.maybe_reload()
+    users = {u["id"]: u for u in _engine.users}
     lists = []
-    for raw in cfg["lists"]:
-        l = core.validate_list(raw)
-        blocked, reason, used = _engine.list_status(l, now)
-        l["status"] = {
-            "blocked": blocked,
-            "reason": reason,
-            "used_minutes": used,
-            "proxy_minutes": core.proxy_minutes(l["id"], day),
-            "leechblock_minutes": core.leechblock_minutes(l["leechblock_set"], day),
-        }
+    for l in _engine.lists:
+        l = dict(l)
+        # Whose status to show: the selected users, or everyone + unassigned devices seen today
+        whos = ["u:" + u for u in l["users"]] if l["users"] else ["u:" + u for u in users]
+        if not l["users"]:
+            whos += [r[0] for r in core.db().execute(
+                "SELECT DISTINCT who FROM usage2 WHERE list_id=? AND day=? AND who LIKE 'd:%'", (l["id"], day))]
+        status = []
+        for who in whos:
+            blocked, reason, used = _engine.list_status(l, who, now)
+            status.append({"who": who, "label": _who_label(who, users), "blocked": blocked, "reason": reason,
+                           "used_minutes": used, "proxy_minutes": core.proxy_minutes(l["id"], who, day)})
+        if not status:  # no users defined yet: show the rule state for an anonymous device
+            blocked, reason, used = _engine.list_status(l, "d:-", now)
+            status.append({"who": "d:-", "label": "everyone", "blocked": blocked, "reason": reason,
+                           "used_minutes": used, "proxy_minutes": used})
+        l["status"] = status
         l["source_info"] = [core.source_info(u) for u in l["sources"]]
         lists.append(l)
+
+    known_macs = {d["mac"] for u in users.values() for d in u["devices"] if d["mac"]}
+    known_ips = {d["ip"] for u in users.values() for d in u["devices"] if d["ip"]}
+    unassigned = [d for d in core.recent_devices()
+                  if d["mac"] not in known_macs and (d["mac"] or d["ip"] not in known_ips)]
     return {
         "now": now.isoformat(timespec="seconds"),
+        "users": list(users.values()),
         "lists": lists,
-        "hosts": [{"host": h, "minutes": m} for h, m in core.host_stats(day)],
+        "unassigned_devices": unassigned[:50],
+        "hosts": [{"host": h, "who": _who_label(w, users), "minutes": m} for h, w, m in core.host_stats(day)],
         "leechblock_reports": core.leechblock_reports(day),
     }
+
+
+def _mutate_users(fn):
+    """Apply fn(cfg) under the lock and save; returns the saved config."""
+    with _lock:
+        cfg = core.load_config()
+        fn(cfg)
+        return core.save_config(cfg)
 
 
 def refresh_sources(lst):
@@ -188,8 +217,13 @@ class Handler(BaseHTTPRequestHandler):
                 if parts[3] == "refresh":
                     return self._send(200, {"refresh": refresh_sources(lst)})
                 if parts[3] == "reset":
-                    core.reset_usage(lst["id"], dt.date.today().isoformat())
+                    who = self._json().get("who")
+                    core.reset_usage(lst["id"], dt.date.today().isoformat(), who)
                     return self._send(200, {"ok": True})
+            if parts == ["api", "users"]:
+                new = core.validate_user(self._json())
+                _mutate_users(lambda cfg: cfg["users"].append(new))
+                return self._send(200, {"user": new})
             if parts == ["api", "import", "leechblock"]:
                 lists, warnings = leechblock.import_options(self._body())
                 with _lock:
@@ -208,6 +242,23 @@ class Handler(BaseHTTPRequestHandler):
         parts, _ = self._path()
         if not self._authed():
             return
+        if len(parts) == 3 and parts[:2] == ["api", "users"]:
+            try:
+                body = self._json()
+                body["id"] = parts[2]
+                new = core.validate_user(body)
+
+                def replace(cfg):
+                    ids = [u["id"] for u in cfg["users"]]
+                    if parts[2] not in ids:
+                        raise KeyError(parts[2])
+                    cfg["users"][ids.index(parts[2])] = new
+                _mutate_users(replace)
+                return self._send(200, {"user": new})
+            except KeyError:
+                return self._send(404, {"error": "no such user"})
+            except (ValueError, json.JSONDecodeError) as e:
+                return self._send(400, {"error": str(e)})
         if len(parts) == 3 and parts[:2] == ["api", "lists"]:
             try:
                 with _lock:
@@ -235,6 +286,11 @@ class Handler(BaseHTTPRequestHandler):
         parts, _ = self._path()
         if not self._authed():
             return
+        if len(parts) == 3 and parts[:2] == ["api", "users"]:
+            def drop(cfg):
+                cfg["users"] = [u for u in cfg["users"] if u["id"] != parts[2]]
+            saved = _mutate_users(drop)  # validate_config also removes the user from lists
+            return self._send(200, {"ok": True, "users": saved["users"]})
         if len(parts) == 3 and parts[:2] == ["api", "lists"]:
             with _lock:
                 cfg = core.load_config()
