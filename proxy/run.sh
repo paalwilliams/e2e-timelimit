@@ -54,7 +54,7 @@ if [ "$(cat /proc/sys/net/ipv4/ip_forward)" != "1" ]; then
 	echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || bashio::log.warning "net.ipv4.ip_forward is 0 and can't be changed"
 fi
 for f in /proc/sys/net/ipv4/conf/all/send_redirects "/proc/sys/net/ipv4/conf/$IF/send_redirects"; do
-	echo 0 > "$f" 2>/dev/null || true
+	{ echo 0 > "$f"; } 2>/dev/null || true  # read-only in add-ons; the OUTPUT rule below covers it
 done
 jump filter OUTPUT -o "$IF" -p icmp --icmp-type redirect -j DROP
 
