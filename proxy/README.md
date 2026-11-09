@@ -1,91 +1,93 @@
 # LeechProxy
 
-Network-wide, hostname-level blocking and daily time limits using Squid, with a
-web UI for managing blocklists, and optional integration with LeechBlock NG.
+Network-wide, per-person blocking and daily time limits by hostname, with a web
+UI for managing blocklists, and optional integration with LeechBlock NG.
+Nothing is decrypted: the proxy only reads the TLS SNI / HTTP Host and splices bytes.
 
 ```
- devices ──► router ──► Squid ──(external ACL)──► leechproxy.acl_helper ─┐
-                          │  peeks at TLS SNI, splices or terminates      │ config.json
-                          ▼                                               │ usage.sqlite3
-                       internet          web UI (leechproxy.webui) ◄──────┘
-                                              ▲
-                     LeechBlock ── POST focused time / GET site lists
+ devices ─► router/gateway ─(REDIRECT 80,443)─► leechproxy-sni (Rust) ──► internet
+                                                   │  "is host X blocked for client IP/MAC?"
+                                                   ▼
+                              leechproxy.acl_helper (Python) ── config.json / usage.sqlite3
+                                                   ▲
+              browser ─► web UI (leechproxy.webui) ┘   ◄── LeechBlock: time reports, site lists
 ```
 
-* **No decryption.** HTTPS is peeked (SNI) and spliced. Rules are per hostname
-  (`reddit.com` also matches every `*.reddit.com`); paths and keywords can't be matched.
-* **Lists** contain hand-entered domains, subscribed blocklists (hosts files,
-  domain-per-line or `||domain^` lists, refreshed daily), exceptions, block periods,
-  a daily limit and active days.
-* **Time** counted by the proxy = distinct minutes in which a device opened a
-  request/connection to the site. It's an approximation: background tabs count, and
-  reading an already-loaded page doesn't. Link a list to a LeechBlock set to also
-  count LeechBlock's focused-tab time (the larger of the two is used).
+* **Lists**: your own domains (`reddit.com` also matches `*.reddit.com`), subscribed
+  blocklists (hosts files, domain lists, `||domain^` lists; refreshed daily), exceptions,
+  block periods, a daily limit, active days, and who it applies to.
+* **People**: each person owns devices identified by MAC (best, survives DHCP) or IP.
+  Every person has their own allowance per list; unassigned devices are tracked
+  individually and listed in the UI for one-click assignment.
+* **Time**: a connection adds a minute to its person's usage only if it moved at least
+  `--active-bytes` during that interval, so idle keep-alives don't count, though
+  background tabs that keep streaming do. Linking a list to a LeechBlock set also
+  counts LeechBlock's focused-tab time from that person's browsers (the larger value wins).
+* **Enforcement**: live connections are re-checked every `--recheck` seconds (15 by
+  default), so reaching a limit or entering a block period also ends ongoing streams.
 
-## Run the web UI
+## Components
+
+| Path | What |
+|---|---|
+| `sni/` | `leechproxy-sni`: Rust (tokio) proxy. `--transparent` for firewall-redirected traffic (Linux), `--explicit` as a normal HTTP/CONNECT proxy (any OS). |
+| `leechproxy/acl_helper.py` | Policy engine, Squid-compatible line protocol; spawned by the proxy (or by Squid). |
+| `leechproxy/webui.py` | Web UI + JSON API, LeechBlock endpoints, block page. |
+| `mac/leechproxy-mac.sh` | Run or install everything on macOS using the system proxy. |
+| `squid.conf`, `run-local.sh` | Alternative frontend using Squid instead of `leechproxy-sni`. |
+
+Build: `cd sni && cargo build --release`. Tests: `cargo test` and
+`python3 -m unittest discover -s tests` (Python 3.9+, stdlib only).
+
+## Try it on a Mac
 
 ```sh
-cd proxy
-LEECHPROXY_DATA=~/.local/share/leechproxy python3 -m leechproxy.webui --port 8080
-# --bind 0.0.0.0 to reach it from other devices; --password X to require basic auth
+./mac/leechproxy-mac.sh run        # UI + proxy, system proxy on; Ctrl-C restores it
+./mac/leechproxy-mac.sh install    # same, but as LaunchAgents that start at login
+./mac/leechproxy-mac.sh uninstall
 ```
 
-Python 3.9+ and nothing else. Tests: `python3 -m unittest discover -s tests`.
+Safari, Chrome and most apps use the system proxy. Some apps ignore it, and it's easy
+to switch off, so for real enforcement run it on the gateway.
+
+## Run on a router / gateway (Linux, OpenWrt)
+
+```sh
+LEECHPROXY_DATA=/var/lib/leechproxy PYTHONPATH=/opt/leechproxy \
+  leechproxy-sni --transparent 0.0.0.0:3130 --block-page http://192.168.1.1:8080/blocked &
+LEECHPROXY_DATA=/var/lib/leechproxy PYTHONPATH=/opt/leechproxy \
+  python3 -m leechproxy.webui --bind 192.168.1.1 --port 8080 --password CHANGE-ME &
+
+LAN=br-lan
+iptables -t nat -A PREROUTING -i $LAN -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports 3130
+iptables -A FORWARD -i $LAN -p udp --dport 443 -j REJECT   # no QUIC/HTTP3: browsers fall back to TCP
+```
+
+* **OpenWrt** (≥128 MB RAM): cross-compile with `cargo zigbuild --release --target
+  aarch64-unknown-linux-musl` (or `mipsel-unknown-linux-musl`, `armv7-…`), and
+  `opkg install python3-light python3-sqlite3`. MAC addresses come from `/proc/net/arp`.
+* **Stock ISP router**: put a Raspberry Pi or mini PC in as the network's gateway
+  (set it as the DHCP default gateway, enable `net.ipv4.ip_forward`), and run the above there.
+* **pfSense/OPNsense**: FreeBSD has no `SO_ORIGINAL_DST`, so use their Squid package
+  with `squid.conf`'s helper lines, or `--explicit` with a WPAD/PAC file.
+* Block DNS-over-HTTPS resolvers and VPNs too if it needs to be hard to bypass.
 
 ## LeechBlock integration
 
 1. **Import**: in LeechBlock, *Options → General → Export Options to Text File*, then
-   *Import from LeechBlock…* in the UI. Each block set becomes a list linked to its set
-   number. Patterns the proxy can't express by hostname (keywords, regexps, path-specific
-   patterns) are skipped and listed as warnings.
-2. **Report time** (this repo's modified LeechBlock): *Options → General → Network Proxy*,
-   set to `http://<ui-host>:8080/api/leechblock/report`. LeechBlock then POSTs every
-   set's focused time for the current limit period every 30 s or more, and the proxy
-   blocks the linked list on *every* device once the limit is used up.
-3. **Share lists back**: set a block set's *Load sites from URL* to
-   `http://<ui-host>:8080/leechblock/set/$S` (or `/leechblock/sites/<list-id>`; add
-   `?sources=1` to include subscribed blocklists, which can be large).
-
-## Where to run Squid
-
-Transparent interception needs Squid on the path packets take, i.e. on the router
-or on a box that devices use as their gateway.
-
-| Setup | Works? | How |
-|---|---|---|
-| **OpenWrt** router (≥256 MB RAM) | Yes | `opkg install squid python3-light python3-sqlite3`, copy this dir, use `squid.conf`, add the firewall redirects below. |
-| **pfSense / OPNsense** | Yes | Built-in Squid package with transparent HTTP + "SSL splice all". Add the `external_acl_type` lines as custom options; run the UI on the box or elsewhere with a shared data dir. |
-| **ASUS Merlin / other Entware routers** | Maybe | Entware has `squid`; low RAM/CPU can be a problem. |
-| **Stock ISP / consumer router** | No | Can't run Squid. Use a Raspberry Pi/Linux box as the network's gateway (set it as the DHCP default gateway) **or** use explicit proxy mode. |
-| **Explicit proxy** (no router changes) | Yes, but opt-in | Run Squid anywhere, set devices' proxy to `host:3128` (or a PAC/WPAD file). Easy to bypass by removing the proxy setting. |
-| **Just this Mac** | Yes, explicit | `brew install squid`, set the macOS/Firefox proxy to `127.0.0.1:3128`. Remove the `https_port`/`3129` lines if you don't intercept. |
-
-### Firewall rules for transparent mode (Linux/OpenWrt, on the Squid box)
-
-```sh
-LAN=br-lan
-iptables -t nat -A PREROUTING -i $LAN -p tcp --dport 80  -j REDIRECT --to-ports 3129
-iptables -t nat -A PREROUTING -i $LAN -p tcp --dport 443 -j REDIRECT --to-ports 3130
-# Force browsers off QUIC/HTTP3 (UDP 443) so they fall back to TCP via Squid:
-iptables -A FORWARD -i $LAN -p udp --dport 443 -j REJECT
-```
-
-Also consider blocking DNS-over-HTTPS resolvers and VPNs if you want it hard to bypass.
-
-Create the (never-used-for-decryption) certificate Squid's `https_port` requires:
-
-```sh
-openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
-  -subj "/CN=leechproxy" -keyout /etc/squid/leechproxy.pem -out /etc/squid/leechproxy.pem
-```
-
-Edit the `###` paths in `squid.conf` (data dir, code dir, block page URL), then
-`squid -k parse && squid -k reconfigure`.
+   *Import from LeechBlock…* in the UI. Each set becomes a list linked to its set number.
+   Keyword, regexp and path-specific patterns are skipped, with warnings.
+2. **Report time** (this repo's LeechBlock): *Options → General → Network Proxy* =
+   `http://<ui-host>:8080/api/leechblock/report`. Focused time is posted every 30 s or
+   more, and attributed to the person who owns the browser's IP.
+3. **Share lists back**: a set's *Load sites from URL* =
+   `http://<ui-host>:8080/leechblock/set/$S` (or `/leechblock/sites/<list-id>`;
+   `?sources=1` includes subscriptions, which can be large).
 
 ## Limitations
 
-* An already-open tunnel (e.g. a long-lived HTTP/2 connection) isn't cut when a limit
-  is reached; it's blocked when the browser opens a new connection.
-* On HTTPS a blocked site shows a connection error, not a block page (that would need
-  decryption). Plain HTTP gets the `/blocked` page.
+* Blocked HTTPS sites get a TLS `access_denied` alert (the browser shows a connection
+  error), not a block page; that would need decryption. Plain HTTP is redirected to `/blocked`.
 * Daily limits only; LeechBlock's other limit periods are applied per day.
+* Transparent mode is IPv4 and IPv6 via netfilter REDIRECT; the MAC is only known for
+  clients on the same L2 segment as the proxy.

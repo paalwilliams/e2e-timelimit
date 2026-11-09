@@ -1,0 +1,17 @@
+[package]
+name = "leechproxy-sni"
+version = "0.1.0"
+edition = "2021"
+description = "Transparent SNI proxy for LeechProxy: per-person, per-site blocking and time limits without TLS decryption"
+license = "MPL-2.0"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "process", "sync", "signal"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

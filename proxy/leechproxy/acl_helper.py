@@ -22,6 +22,10 @@ from .core import Engine
 def handle(engine, line):
     parts = line.split()
     chan = ""
+    count = True
+    if len(parts) >= 6:  # leechproxy-sni: "<chan> <ip> <mac> <sni> <dst> <count 0|1>"
+        count = parts[5] != "0"
+        parts = parts[:5]
     if len(parts) >= 5:  # concurrency>0: leading channel ID
         chan, parts = parts[0], parts[1:]
     vals = [urllib.parse.unquote(p) for p in parts] + ["-"] * 4
@@ -29,7 +33,7 @@ def handle(engine, line):
     host = sni if sni not in ("", "-") else dst
     prefix = f"{chan} " if chan else ""
     try:
-        blocked, name, reason = engine.check(host, mac=mac, ip=ip)
+        blocked, name, reason = engine.check(host, mac=mac, ip=ip, count=count)
     except Exception as e:  # fail open
         sys.stderr.write(f"leechproxy: error checking {host!r}: {e}\n")
         return prefix + "ERR"
