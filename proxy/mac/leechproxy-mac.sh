@@ -4,7 +4,8 @@
 #
 #   ./leechproxy-mac.sh run         # foreground; Ctrl-C stops and restores proxy settings
 #   ./leechproxy-mac.sh install     # LaunchAgents (start at login) + system proxy on
-#   ./leechproxy-mac.sh uninstall   # remove LaunchAgents, system proxy off
+#   ./leechproxy-mac.sh trust-ca    # trust the local CA so blocked HTTPS sites show a block page
+#   ./leechproxy-mac.sh uninstall   # remove LaunchAgents and CA trust, system proxy off
 #   ./leechproxy-mac.sh status
 #
 # Apps that honour the system proxy (Safari, Chrome, Edge, most apps) go through
@@ -116,8 +117,18 @@ EOF
 	proxy_on
 	echo "Installed. Web UI: http://127.0.0.1:$UI_PORT/  Logs: $DATA/{web,proxy}.log"
 	;;
+trust-ca)
+	# Trust the proxy's local CA so blocked HTTPS sites show the block page.
+	# It's only ever used to sign certificates for *blocked* hosts.
+	CA="$DATA/ca/ca.pem"
+	[ -f "$CA" ] || { echo "No CA yet at $CA: run 'install' or 'run' first"; exit 1; }
+	security add-trusted-cert -r trustRoot -p ssl -k "$HOME/Library/Keychains/login.keychain-db" "$CA"
+	echo "Trusted $CA (login keychain). Firefox/Zen: set security.enterprise_roots.enabled = true in about:config."
+	;;
 uninstall)
 	proxy_off
+	security delete-certificate -c "LeechProxy Local CA" "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null \
+		&& echo "Removed LeechProxy Local CA from login keychain" || true
 	for a in web sni; do
 		launchctl bootout "gui/$(id -u)/$LABEL.$a" 2>/dev/null || true
 		rm -f "$AGENTS/$LABEL.$a.plist"

@@ -3,6 +3,7 @@
 //! Policy decisions come from the LeechProxy Python helper; this binary only
 //! moves bytes, measures activity, and cuts connections when told to.
 
+mod blockpage;
 mod helper;
 mod net;
 mod parse;
@@ -42,6 +43,8 @@ struct ConnState {
 
 struct App {
     cfg: Config,
+    /// Local CA for HTTPS block pages (None = just reset blocked TLS connections)
+    tls: Option<blockpage::BlockTls>,
     helper: Helper,
     arp: net::Arp,
     conns: Mutex<HashMap<u64, Arc<ConnState>>>,
@@ -149,8 +152,17 @@ impl App {
             let d = self.decide(&ip, mac.as_deref(), h, &dst.ip().to_string(), false).await;
             if d.blocked {
                 self.log(format_args!("BLOCK {ip} {} {h} {}", mac.as_deref().unwrap_or("-"), d.message));
-                let resp = if is_http { self.blocked_http(h, &d) } else { TLS_ALERT_ACCESS_DENIED.to_vec() };
-                let _ = client.write_all(&resp).await;
+                if is_http {
+                    let _ = client.write_all(&self.blocked_http(h, &d)).await;
+                } else if let Some(tls) = &self.tls {
+                    let resp = self.blocked_http(h, &d);
+                    if let Err(e) = tls.serve(blockpage::Prefixed::new(buf, client), h, &resp).await {
+                        self.log(format_args!("block page for {h} not shown: {e}"));
+                    }
+                    return;
+                } else {
+                    let _ = client.write_all(TLS_ALERT_ACCESS_DENIED).await;
+                }
                 let _ = client.shutdown().await;
                 return;
             }
@@ -189,6 +201,17 @@ impl App {
             let d = self.decide(&ip, mac.as_deref(), &host, "-", false).await;
             if d.blocked {
                 self.log(format_args!("BLOCK {ip} {host} {}", d.message));
+                if let (Some(tls), 443) = (&self.tls, port) {
+                    // Browsers ignore proxy error pages for CONNECT, so accept the tunnel
+                    // and answer inside it with our own TLS session + redirect.
+                    if client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.is_ok() {
+                        let resp = self.blocked_http(&host, &d);
+                        if let Err(e) = tls.serve(blockpage::Prefixed::new(rest, client), &host, &resp).await {
+                            self.log(format_args!("block page for {host} not shown: {e}"));
+                        }
+                    }
+                    return;
+                }
                 let body = format!("Blocked by LeechProxy: {}", d.message);
                 let resp = format!("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                 let _ = client.write_all(resp.as_bytes()).await;
@@ -303,6 +326,8 @@ leechproxy-sni [options]
   --block-page URL          redirect blocked plain-HTTP requests here, e.g. http://192.168.1.1:8080/blocked
   --active-bytes N          bytes per recheck interval for a connection to count as active (default 2048)
   --recheck SECS            seconds between live-connection checks (default 15)
+  --ca-dir DIR              local CA for HTTPS block pages (default: $LEECHPROXY_DATA/ca)
+  --no-block-page-tls       don't show block pages for HTTPS; just reset blocked connections
   --quiet                   don't log blocks/cuts
 Environment (passed to the helper): LEECHPROXY_DATA, PYTHONPATH";
 
@@ -312,6 +337,8 @@ async fn main() {
     let mut explicit = vec![];
     let mut helper_cmd = "python3 -m leechproxy.acl_helper".to_string();
     let mut cfg = Config { block_page: None, active_bytes: 2048, recheck: Duration::from_secs(15), quiet: false };
+    let mut ca_dir = std::env::var("LEECHPROXY_DATA").map(|d| format!("{d}/ca")).unwrap_or_else(|_| "ca".into());
+    let mut block_tls = true;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut val = || args.next().unwrap_or_else(|| { eprintln!("{a} needs a value\n\n{USAGE}"); std::process::exit(2) });
@@ -323,6 +350,8 @@ async fn main() {
             "--active-bytes" => cfg.active_bytes = val().parse().expect("--active-bytes: number"),
             "--recheck" => cfg.recheck = Duration::from_secs(val().parse().expect("--recheck: seconds")),
             "--quiet" => cfg.quiet = true,
+            "--ca-dir" => ca_dir = val(),
+            "--no-block-page-tls" => block_tls = false,
             "-h" | "--help" => { println!("{USAGE}"); return; }
             _ => { eprintln!("unknown option {a}\n\n{USAGE}"); std::process::exit(2) }
         }
@@ -335,8 +364,22 @@ async fn main() {
         eprintln!("warning: --transparent needs Linux (netfilter REDIRECT); use --explicit on this OS");
     }
 
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let tls = if block_tls {
+        match blockpage::BlockTls::load_or_create(std::path::Path::new(&ca_dir)) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!("HTTPS block pages disabled: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let app = Arc::new(App {
         cfg,
+        tls,
         helper: Helper::new(helper_cmd.split_whitespace().map(String::from).collect()),
         arp: net::Arp::new(),
         conns: Mutex::new(HashMap::new()),
