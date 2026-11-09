@@ -49,6 +49,14 @@ Build: `cd sni && cargo build --release`. Tests: `cargo test` and
 Safari, Chrome and most apps use the system proxy. Some apps ignore it, and it's easy
 to switch off, so for real enforcement run it on the gateway.
 
+## Home Assistant add-on (HA as the network gateway)
+
+This directory is also a Home Assistant add-on (`config.yaml`, `Dockerfile`, `run.sh`;
+user docs in `DOCS.md`). Install it either by copying `proxy/` to `/addons/leechproxy`
+(local add-on), or by adding `https://github.com/paalwilliams/e2e-timelimit#leechproxy`
+under *Settings → Add-ons → Add-on store → ⋮ → Repositories*. Then set your router's
+DHCP gateway to the HA host.
+
 ## Run on a router / gateway (Linux, OpenWrt)
 
 ```sh

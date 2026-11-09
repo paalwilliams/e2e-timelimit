@@ -164,7 +164,7 @@ function flash(text, kind = "info") {
 const fmtMin = m => m >= 60 ? `${Math.floor(m/60)}h ${m%60}m` : `${m}m`;
 
 async function load() {
-  try { S = await api("GET", "/api/state"); } catch (e) { return flash("Cannot load state: " + e.message, "err"); }
+  try { S = await api("GET", "api/state"); } catch (e) { return flash("Cannot load state: " + e.message, "err"); }
   $("#now").textContent = S.now.replace("T", " ");
   render();
 }
@@ -172,7 +172,7 @@ async function load() {
 function render() {
   const base = location.origin;
   $("#caCard").innerHTML = S.ca_installed_hint
-    ? `<p style="margin:0">Blocked HTTPS sites show a block page only on devices that trust the proxy's local CA (used <em>only</em> for blocked sites; other traffic is never decrypted). <a href="/ca.pem" download="leechproxy-ca.pem">Download the CA</a> and install it on each device (macOS: <code>mac/leechproxy-mac.sh install</code> does this).</p>`
+    ? `<p style="margin:0">Blocked HTTPS sites show a block page only on devices that trust the proxy's local CA (used <em>only</em> for blocked sites; other traffic is never decrypted). <a href="ca.pem" download="leechproxy-ca.pem">Download the CA</a> and install it on each device (macOS: <code>mac/leechproxy-mac.sh trust-ca</code>).</p>`
     : `<p class="muted" style="margin:0">The proxy creates its local CA on first start.</p>`;
 
   const userName = id => (S.users.find(u => u.id === id) || {}).name || "?";
@@ -269,7 +269,7 @@ $("#editForm").addEventListener("submit", async ev => {
   };
   delete body.status; delete body.source_info;
   try {
-    const r = editing ? await api("PUT", "/api/lists/" + editing.id, body) : await api("POST", "/api/lists", body);
+    const r = editing ? await api("PUT", "api/lists/" + editing.id, body) : await api("POST", "api/lists", body);
     $("#editDlg").close();
     const errs = (r.refresh || []).filter(x => x.error);
     if (errs.length) flash("Saved, but some subscriptions failed:\n" + errs.map(e => `${e.url}: ${e.error}`).join("\n"), "err");
@@ -280,7 +280,7 @@ $("#editForm").addEventListener("submit", async ev => {
 $("#cancelBtn").onclick = () => $("#editDlg").close();
 $("#deleteBtn").onclick = async () => {
   if (!editing || !confirm(`Delete "${editing.name}"?`)) return;
-  await api("DELETE", "/api/lists/" + editing.id);
+  await api("DELETE", "api/lists/" + editing.id);
   $("#editDlg").close(); load();
 };
 $("#addBtn").onclick = () => openEdit(null);
@@ -291,14 +291,14 @@ $("#lists").addEventListener("click", async ev => {
   if (b.dataset.refresh) {
     b.disabled = true; b.textContent = "Refreshing…";
     try {
-      const r = await api("POST", `/api/lists/${b.dataset.refresh}/refresh`);
+      const r = await api("POST", `api/lists/${b.dataset.refresh}/refresh`);
       const errs = r.refresh.filter(x => x.error);
       flash(errs.length ? errs.map(e => `${e.url}: ${e.error}`).join("\n") : "Subscriptions refreshed.", errs.length ? "err" : "info");
     } catch (e) { flash(e.message, "err"); }
     load();
   }
   if (b.dataset.reset && confirm("Reset today's proxy-counted time for this list?")) {
-    await api("POST", `/api/lists/${b.dataset.reset}/reset`, { who: b.dataset.who }); load();
+    await api("POST", `api/lists/${b.dataset.reset}/reset`, { who: b.dataset.who }); load();
   }
 });
 
@@ -322,7 +322,7 @@ function parseDevices(text) {
   });
 }
 async function saveUser(u) {
-  return u.id ? api("PUT", "/api/users/" + u.id, u) : api("POST", "/api/users", u);
+  return u.id ? api("PUT", "api/users/" + u.id, u) : api("POST", "api/users", u);
 }
 $("#userForm").addEventListener("submit", async ev => {
   ev.preventDefault();
@@ -335,7 +335,7 @@ $("#userForm").addEventListener("submit", async ev => {
 $("#userCancel").onclick = () => $("#userDlg").close();
 $("#userDelete").onclick = async () => {
   if (!editingUser || !confirm(`Delete ${editingUser.name}? Their devices become unassigned.`)) return;
-  await api("DELETE", "/api/users/" + editingUser.id); $("#userDlg").close(); load();
+  await api("DELETE", "api/users/" + editingUser.id); $("#userDlg").close(); load();
 };
 $("#addUserBtn").onclick = () => openUser(null);
 $("#users").addEventListener("click", ev => {

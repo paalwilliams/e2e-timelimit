@@ -34,6 +34,7 @@ STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 _lock = threading.Lock()  # serialize config read-modify-write
 _engine = core.Engine()
 PASSWORD = None
+ADMIN_IPS = set()  # clients allowed to use the UI/API without a password
 
 
 def _who_label(who, users):
@@ -138,16 +139,21 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self._body() or "{}")
 
     def _authed(self):
-        if not PASSWORD:
+        if ADMIN_IPS and self.client_address[0] in ADMIN_IPS:
+            return True  # e.g. Home Assistant ingress
+        if not PASSWORD and not ADMIN_IPS:
             return True
         h = self.headers.get("Authorization", "")
-        if h.startswith("Basic "):
+        if PASSWORD and h.startswith("Basic "):
             try:
                 _, pw = base64.b64decode(h[6:]).decode().split(":", 1)
                 if hmac.compare_digest(pw, PASSWORD):
                     return True
             except Exception:
                 pass
+        if not PASSWORD:
+            self._send(403, {"error": "admin access is only allowed via Home Assistant"})
+            return False
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="LeechProxy"')
         self.send_header("Content-Length", "0")
@@ -327,8 +333,12 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--password", default=os.environ.get("LEECHPROXY_PASSWORD"),
                     help="require HTTP basic auth (any username) for the UI/API")
+    ap.add_argument("--admin-ip", action="append", default=[],
+                    help="client IP allowed to use the UI/API without a password (repeatable); "
+                         "when given, everyone else needs --password or is refused")
     args = ap.parse_args()
-    PASSWORD = args.password
+    PASSWORD = args.password or None
+    ADMIN_IPS.update(args.admin_ip)
     os.makedirs(core.DATA_DIR, exist_ok=True)
     threading.Thread(target=refresh_all_loop, daemon=True).start()
     srv = ThreadingHTTPServer((args.bind, args.port), Handler)
