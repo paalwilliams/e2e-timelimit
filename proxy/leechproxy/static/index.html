@@ -69,12 +69,11 @@ select { font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-
     <h1>LeechProxy</h1>
     <span class="muted" id="now"></span>
   </header>
-  <p class="muted">Network-wide blocking and time limits by hostname. Lists can hold your own domains,
-    subscribed blocklists (hosts files / domain lists), and can be linked to a LeechBlock block set.</p>
+  <p class="muted">Network-wide blocking and time limits by hostname. Lists can hold your own domains
+    and subscribed blocklists (hosts files / domain lists).</p>
   <div id="flash"></div>
 
   <h2 class="row"><span class="grow">Blocklists</span>
-    <button id="importBtn">Import from LeechBlock…</button>
     <button class="primary" id="addBtn">Add list</button></h2>
   <div id="lists"></div>
 
@@ -85,15 +84,8 @@ select { font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-
   <div id="users"></div>
   <div id="unassigned"></div>
 
-  <h2>LeechBlock browsers</h2>
-  <div class="card">
-    <p style="margin-top:0">In LeechBlock: <em>Options → General → Network Proxy</em>, set the report URL to
-      <code id="reportUrl"></code>. Its focused-tab time then counts towards linked lists here (the larger of
-      proxy-observed and LeechBlock-reported time is used).</p>
-    <p>To have a LeechBlock set use a list from here, put its URL in the set's <em>Load sites from URL</em> field,
-      e.g. <code id="setUrl"></code> (<code>$S</code> = set number).</p>
-    <div id="reports"></div>
-  </div>
+  <h2>Block pages for HTTPS</h2>
+  <div class="card" id="caCard"></div>
 
   <h2>Today's activity (proxy-observed)</h2>
   <div class="card" id="hosts"></div>
@@ -126,8 +118,6 @@ select { font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-
       <div style="font-size:.88rem;font-weight:500;margin-bottom:4px">Applies to <small class="muted">none selected = everyone, including unassigned devices; each person has their own daily limit</small></div>
       <div class="days" id="usersBox"></div>
     </div>
-    <label>Linked LeechBlock set number <small class="muted">optional; adds that set's reported focused time</small>
-      <input type="number" name="leechblock_set" min="1" max="99" style="max-width:120px"></label>
     <p class="muted" style="margin:0"><small>No periods and no limit = blocked all day on the selected days.
       Periods and a limit = blocked during the periods <em>or</em> once the limit is used up.</small></p>
     <div id="editErr"></div>
@@ -150,22 +140,6 @@ select { font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-
       <button type="button" class="danger" id="userDelete" style="margin-right:auto">Delete</button>
       <button type="button" id="userCancel">Cancel</button>
       <button type="submit" class="primary">Save</button>
-    </div>
-  </form>
-</dialog>
-
-<dialog id="importDlg">
-  <form id="importForm" method="dialog">
-    <h2 style="margin:0">Import from LeechBlock</h2>
-    <p class="muted" style="margin:0">In LeechBlock: <em>Options → General → Export Options to Text File</em> (or JSON),
-      then choose the file here. Each block set becomes a list linked to that set number; re-importing replaces them.
-      Keyword, regexp and path-specific patterns can't be enforced by hostname and are skipped.</p>
-    <input type="file" id="importFile" accept=".txt,.json,text/plain,application/json">
-    <textarea id="importText" placeholder="…or paste the exported text here"></textarea>
-    <div id="importErr"></div>
-    <div class="row" style="justify-content:flex-end">
-      <button type="button" id="importCancel">Cancel</button>
-      <button type="submit" class="primary">Import</button>
     </div>
   </form>
 </dialog>
@@ -197,8 +171,9 @@ async function load() {
 
 function render() {
   const base = location.origin;
-  $("#reportUrl").textContent = base + "/api/leechblock/report";
-  $("#setUrl").textContent = base + "/leechblock/set/$S";
+  $("#caCard").innerHTML = S.ca_installed_hint
+    ? `<p style="margin:0">Blocked HTTPS sites show a block page only on devices that trust the proxy's local CA (used <em>only</em> for blocked sites; other traffic is never decrypted). <a href="/ca.pem" download="leechproxy-ca.pem">Download the CA</a> and install it on each device (macOS: <code>mac/leechproxy-mac.sh install</code> does this).</p>`
+    : `<p class="muted" style="margin:0">The proxy creates its local CA on first start.</p>`;
 
   const userName = id => (S.users.find(u => u.id === id) || {}).name || "?";
   $("#lists").innerHTML = S.lists.length ? S.lists.map(l => {
@@ -216,7 +191,6 @@ function render() {
     if (lim != null) rules.push(`limit ${fmtMin(lim)}/day`);
     if (!l.periods.length && lim == null) rules.push("always blocked");
     if (l.days.length < 7) rules.push(l.days.join(" "));
-    if (l.leechblock_set) rules.push(`LeechBlock set ${l.leechblock_set}`);
     rules.push(l.users.length ? "for " + l.users.map(userName).join(", ") : "for everyone");
     const rows = l.status.map(st => {
       const pct = lim ? Math.min(100, 100 * st.used_minutes / lim) : 0;
@@ -236,7 +210,7 @@ function render() {
       <div class="meta">${esc(rules.join(" · "))}</div>
       ${rows}
     </div>`;
-  }).join("") : `<div class="card empty">No lists yet. Add one, or import your LeechBlock block sets.</div>`;
+  }).join("") : `<div class="card empty">No lists yet. Add one to start blocking.</div>`;
 
   $("#users").innerHTML = S.users.length ? S.users.map(u => `<div class="card"><div class="row">
       <span class="name grow">${esc(u.name)}</span><button data-user="${u.id}">Edit</button></div>
@@ -252,12 +226,6 @@ function render() {
       <td><select data-assign="${i}"><option value="">Assign to…</option>
         ${S.users.map(u => `<option value="${u.id}">${esc(u.name)}</option>`).join("")}</select></td></tr>`).join("")}
     </table></div>` : "";
-
-  const rep = S.leechblock_reports;
-  $("#reports").innerHTML = rep.length ? `<table><tr><th>Browser</th><th>Set</th><th>Name</th><th class="num">Today</th><th>Last report</th></tr>
-    ${rep.map(r => `<tr><td>${esc(r.client)}</td><td>${r.set}</td><td>${esc(r.name)}</td>
-      <td class="num">${fmtMin(Math.floor(r.secs/60))}</td><td>${new Date(r.updated*1000).toLocaleTimeString()}</td></tr>`).join("")}</table>`
-    : `<p class="muted" style="margin-bottom:0">No reports from LeechBlock today.</p>`;
 
   $("#hosts").innerHTML = S.hosts.length ? `<table><tr><th>Host</th><th>Who</th><th class="num">Active minutes</th></tr>
     ${S.hosts.map(h => `<tr><td>${esc(h.host)}</td><td>${esc(h.who)}</td><td class="num">${fmtMin(h.minutes)}</td></tr>`).join("")}</table>`
@@ -277,7 +245,6 @@ function openEdit(l) {
   f.allow.value = (l?.allow ?? []).join("\n");
   f.periods.value = (l?.periods ?? []).join(", ");
   f.limit_minutes.value = l?.limit_minutes ?? "";
-  f.leechblock_set.value = l?.leechblock_set ?? "";
   const days = l?.days ?? DAYS;
   $("#daysBox").innerHTML = DAYS.map(d => `<label><input type="checkbox" value="${d}" ${days.includes(d)?"checked":""}>${d}</label>`).join("");
   const lu = l?.users ?? [];
@@ -297,7 +264,6 @@ $("#editForm").addEventListener("submit", async ev => {
     name: f.name.value, enabled: f.enabled.checked,
     domains: lines(f.domains.value), sources: lines(f.sources.value), allow: lines(f.allow.value),
     periods: lines(f.periods.value), limit_minutes: f.limit_minutes.value || null,
-    leechblock_set: f.leechblock_set.value || null,
     days: [...$("#daysBox").querySelectorAll("input:checked")].map(i => i.value),
     users: [...$("#usersBox").querySelectorAll("input:checked")].map(i => i.value),
   };
@@ -385,22 +351,6 @@ $("#unassigned").addEventListener("change", async ev => {
   try { await saveUser({ ...u, devices: [...u.devices, dev] }); flash(`Assigned to ${u.name}.`); }
   catch (e) { flash(e.message, "err"); }
   load();
-});
-
-$("#importBtn").onclick = () => { $("#importErr").innerHTML = ""; $("#importText").value = ""; $("#importFile").value = ""; $("#importDlg").showModal(); };
-$("#importCancel").onclick = () => $("#importDlg").close();
-$("#importFile").onchange = async ev => { const f = ev.target.files[0]; if (f) $("#importText").value = await f.text(); };
-$("#importForm").addEventListener("submit", async ev => {
-  ev.preventDefault();
-  const text = $("#importText").value.trim();
-  if (!text) return;
-  try {
-    const r = await api("POST", "/api/import/leechblock", text, true);
-    $("#importDlg").close();
-    flash(`Imported ${r.imported} block set${r.imported === 1 ? "" : "s"}.` + (r.warnings.length ? "\n\n" + r.warnings.join("\n") : ""),
-      r.warnings.length ? "err" : "info");
-    load();
-  } catch (e) { $("#importErr").innerHTML = `<div class="msg err">${esc(e.message)}</div>`; }
 });
 
 load();

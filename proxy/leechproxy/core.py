@@ -42,8 +42,6 @@ DEFAULT_LIST = {
     "limit_minutes": None,  # daily allowance per user; None = no limit
     "days": DAYS[:],      # days on which the rules apply
     "users": [],          # user ids this list applies to; empty = everyone (incl. unknown devices)
-    "leechblock_set": None,  # LeechBlock block set number whose reported time also counts
-    "imported": False,    # created by LeechBlock import (re-import replaces it)
 }
 
 
@@ -124,7 +122,6 @@ def validate_list(raw, user_ids=None):
     out["id"] = str(raw.get("id") or uuid.uuid4().hex[:12])
     out["name"] = str(raw.get("name") or "Untitled").strip()[:100]
     out["enabled"] = bool(raw.get("enabled", True))
-    out["imported"] = bool(raw.get("imported", False))
 
     for key in ("domains", "allow"):
         vals = []
@@ -179,15 +176,6 @@ def validate_list(raw, user_ids=None):
     if user_ids is not None:
         users = [u for u in users if u in user_ids]  # drop references to deleted users
     out["users"] = list(dict.fromkeys(users))
-
-    lbs = raw.get("leechblock_set")
-    if lbs in (None, "", 0, "0"):
-        out["leechblock_set"] = None
-    else:
-        lbs = int(lbs)
-        if not 1 <= lbs <= 99:
-            raise ValueError("leechblock_set must be 1-99")
-        out["leechblock_set"] = lbs
     return out
 
 
@@ -299,8 +287,6 @@ def db():
                 PRIMARY KEY (host, who, day, minute)) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS devices (mac TEXT, ip TEXT, last_seen INTEGER,
                 PRIMARY KEY (mac, ip)) WITHOUT ROWID;
-            CREATE TABLE IF NOT EXISTS lbreports (client TEXT, lbset INTEGER, day TEXT,
-                name TEXT, secs INTEGER, updated INTEGER, PRIMARY KEY (client, lbset, day)) WITHOUT ROWID;
         """)
         _local.conn = conn
     return conn
@@ -349,39 +335,6 @@ def reset_usage(list_id, day, who=None):
             c.execute("DELETE FROM usage2 WHERE list_id=? AND day=? AND who=?", (list_id, day, who))
         else:
             c.execute("DELETE FROM usage2 WHERE list_id=? AND day=?", (list_id, day))
-
-
-def record_leechblock_report(client, payload, now=None):
-    """Store a report POSTed by LeechBlock's reportTimeDataToProxy().
-    Only time from the current limit period is used, and only if that period
-    started today (i.e. a daily limit, or a shorter period within today)."""
-    now = now or dt.datetime.now()
-    day = now.strftime("%Y-%m-%d")
-    midnight = dt.datetime.combine(now.date(), dt.time()).timestamp()
-    count = 0
-    with db() as c:
-        for s in payload.get("sets") or []:
-            try:
-                lbset = int(s["set"])
-                start = float(s.get("periodStart") or 0)
-                secs = int(float(s.get("periodSecs") or 0))
-            except (KeyError, TypeError, ValueError):
-                continue
-            if start < midnight - 60:  # period started before today: not comparable to a daily count
-                secs = 0
-            c.execute(
-                "INSERT OR REPLACE INTO lbreports VALUES (?,?,?,?,?,?)",
-                (normalize_ip(client) or client, lbset, day, str(s.get("name") or "")[:100], max(0, secs), int(time.time())),
-            )
-            count += 1
-    return count
-
-
-def leechblock_reports(day):
-    rows = db().execute(
-        "SELECT client, lbset, name, secs, updated FROM lbreports WHERE day=? ORDER BY lbset, client", (day,)
-    ).fetchall()
-    return [dict(zip(("client", "set", "name", "secs", "updated"), r)) for r in rows]
 
 
 # ----------------------------------------------------------------- matching
@@ -463,13 +416,6 @@ class Engine:
             return user, "u:" + user["id"]
         return None, "d:" + (mac or ip or "unknown")
 
-    def ips_of(self, who):
-        """IPs whose LeechBlock reports count for this who-key."""
-        if who.startswith("u:"):
-            return [ip for ip, u in self.by_ip.items() if u["id"] == who[2:]]
-        dev = who[2:]
-        return [dev] if normalize_ip(dev) else []
-
     def matching_lists(self, host, user):
         hit, exc = set(), set()
         for s in host_suffixes(host):
@@ -479,16 +425,7 @@ class Engine:
                 and (not l["users"] or (user and user["id"] in l["users"]))]
 
     def used_minutes(self, l, who, day):
-        """Proxy-observed minutes, or LeechBlock-reported minutes if larger.
-        (max rather than sum: the same browsing usually shows up in both.)"""
-        used = proxy_minutes(l["id"], who, day)
-        ips = self.ips_of(who)
-        if l["leechblock_set"] and ips:
-            q = "SELECT COALESCE(SUM(secs),0) FROM lbreports WHERE lbset=? AND day=? AND client IN (%s)" % \
-                ",".join("?" * len(ips))
-            secs = db().execute(q, (l["leechblock_set"], day, *ips)).fetchone()[0]
-            used = max(used, secs // 60)
-        return used
+        return proxy_minutes(l["id"], who, day)
 
     def list_status(self, l, who, now):
         """Return (blocked: bool, reason: str|None, used_minutes: int)."""

@@ -324,46 +324,6 @@ function saveTimeData() {
 	}
 }
 
-// Report time data to LeechProxy server (if URL specified)
-//
-var gProxyReportTime = 0;
-
-function reportTimeDataToProxy() {
-	let url = gOptions["proxyReportURL"];
-	if (!url || !/^https?:\/\//.test(url)) {
-		return;
-	}
-
-	// Report at most once every 30 seconds
-	let now = Date.now();
-	if (now - gProxyReportTime < 30000) {
-		return;
-	}
-	gProxyReportTime = now;
-
-	let sets = [];
-	for (let set = 1; set <= gNumSets; set++) {
-		if (!gOptions[`sites${set}`]) continue;
-		let timedata = gOptions[`timedata${set}`];
-		sets.push({
-			set: set,
-			name: gOptions[`setName${set}`],
-			limitMins: gOptions[`limitMins${set}`],
-			limitPeriod: gOptions[`limitPeriod${set}`],
-			periodStart: timedata[2], // start of current limit period (secs since epoch)
-			periodSecs: timedata[3], // secs spent in current limit period
-		});
-	}
-
-	fetch(url, {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ time: Math.floor(now / 1000), sets: sets }),
-	}).catch(
-		function (error) { warn("Cannot report time data to proxy: " + error); }
-	);
-}
-
 // Restart time data
 //
 function restartTimeData(set) {
@@ -2017,7 +1977,6 @@ function onInterval() {
 
 		if (++gSaveSecsCount >= gOptions["saveSecs"]) {
 			saveTimeData();
-			reportTimeDataToProxy();
 			gSaveSecsCount = 0;
 		}
 	}

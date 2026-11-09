@@ -135,7 +135,6 @@ const GENERAL_OPTIONS = {
 	autoExportSync: { type: "boolean", def: true, id: "autoExportSync" }, // default: enabled
 	lockdownHours: { type: "string", def: "", id: null }, // default: blank
 	lockdownMins: { type: "string", def: "", id: null }, // default: blank
-	proxyReportURL: { type: "string", def: "", id: "proxyReportURL" }, // default: no proxy reporting
 };
 
 // Create list of object properties (useful for debugging)

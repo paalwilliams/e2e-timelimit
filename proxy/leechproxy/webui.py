@@ -2,20 +2,18 @@
 
     python3 -m leechproxy.webui [--bind 127.0.0.1] [--port 8080] [--password SECRET]
 
-Endpoints (UI/API are behind --password if given; the LeechBlock and blocked-page
-endpoints are not, since browsers and Squid call them unattended):
+Endpoints (UI/API are behind --password if given; /blocked and /ca.pem are not,
+since every device on the network needs them):
   GET  /                              config UI
-  GET  /api/state                     lists + today's usage + LeechBlock reports
+  GET  /api/state                     lists, people, today's usage
   POST /api/lists                     create list            (JSON body)
   PUT  /api/lists/<id>                replace list           (JSON body)
   DELETE /api/lists/<id>              delete list
   POST /api/lists/<id>/refresh        re-download subscribed blocklists
-  POST /api/lists/<id>/reset          reset today's proxy-counted usage
-  POST /api/import/leechblock         import a LeechBlock options export (raw body)
-  POST /api/leechblock/report         time report from LeechBlock (proxyReportURL option)
-  GET  /leechblock/sites/<id>         list as LeechBlock sites (for "Load sites from URL")
-  GET  /leechblock/set/<n>            all lists linked to LeechBlock set n ($S in sitesURL)
-  GET  /blocked                       block page for Squid deny_info
+  POST /api/lists/<id>/reset          reset today's usage
+  POST/PUT/DELETE /api/users[/<id>]   manage people and their devices
+  GET  /blocked?host=&msg=            block page (the proxy redirects blocked requests here)
+  GET  /ca.pem                        the proxy's local CA, to install on devices
 """
 
 import argparse
@@ -30,7 +28,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import core, leechblock
+from . import core
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 _lock = threading.Lock()  # serialize config read-modify-write
@@ -80,7 +78,7 @@ def state():
         "lists": lists,
         "unassigned_devices": unassigned[:50],
         "hosts": [{"host": h, "who": _who_label(w, users), "minutes": m} for h, w, m in core.host_stats(day)],
-        "leechblock_reports": core.leechblock_reports(day),
+        "ca_installed_hint": os.path.exists(os.path.join(core.DATA_DIR, "ca", "ca.pem")),
     }
 
 
@@ -156,10 +154,6 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         return False
 
-    def log_message(self, fmt, *args):
-        if not self.path.startswith("/api/leechblock/report"):
-            super().log_message(fmt, *args)
-
     def _path(self):
         u = urllib.parse.urlsplit(self.path)
         return [p for p in u.path.split("/") if p], urllib.parse.parse_qs(u.query)
@@ -176,10 +170,12 @@ class Handler(BaseHTTPRequestHandler):
         parts, q = self._path()
         if parts[:1] == ["blocked"]:
             return self._blocked_page(q)
-        if parts[:2] == ["leechblock", "sites"] and len(parts) == 3:
-            return self._lb_sites(lambda l: l["id"] == parts[2].removesuffix(".txt"), q)
-        if parts[:2] == ["leechblock", "set"] and len(parts) == 3 and parts[2].isdigit():
-            return self._lb_sites(lambda l: l["leechblock_set"] == int(parts[2]), q)
+        if parts == ["ca.pem"]:
+            try:
+                with open(os.path.join(core.DATA_DIR, "ca", "ca.pem"), "rb") as f:
+                    return self._send(200, f.read(), "application/x-pem-file")
+            except FileNotFoundError:
+                return self._send(404, "CA not created yet: start leechproxy-sni once", "text/plain")
         if not self._authed():
             return
         if not parts:
@@ -191,12 +187,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parts, _ = self._path()
-        if parts == ["api", "leechblock", "report"]:
-            try:
-                n = core.record_leechblock_report(self.client_address[0], self._json())
-            except (ValueError, AttributeError) as e:
-                return self._send(400, {"error": str(e)})
-            return self._send(200, {"ok": True, "sets": n})
         if not self._authed():
             return
         try:
@@ -224,16 +214,6 @@ class Handler(BaseHTTPRequestHandler):
                 new = core.validate_user(self._json())
                 _mutate_users(lambda cfg: cfg["users"].append(new))
                 return self._send(200, {"user": new})
-            if parts == ["api", "import", "leechblock"]:
-                lists, warnings = leechblock.import_options(self._body())
-                with _lock:
-                    cfg = core.load_config()
-                    # Re-importing replaces lists previously imported for the same set number
-                    linked = {l["leechblock_set"] for l in lists}
-                    cfg["lists"] = [l for l in cfg["lists"] if not (l.get("imported") and l.get("leechblock_set") in linked)]
-                    cfg["lists"] += lists
-                    saved = core.save_config(cfg)
-                return self._send(200, {"imported": len(lists), "warnings": warnings, "lists": saved["lists"]})
         except (ValueError, json.JSONDecodeError) as e:
             return self._send(400, {"error": str(e)})
         self._send(404, {"error": "not found"})
@@ -307,33 +287,36 @@ class Handler(BaseHTTPRequestHandler):
                 return core.validate_list(l)
         return None
 
-    def _lb_sites(self, pred, q):
-        lists = [core.validate_list(l) for l in core.load_config()["lists"]]
-        lists = [l for l in lists if pred(l)]
-        if not lists:
-            return self._send(404, "", "text/plain")
-        with_sources = q.get("sources", ["0"])[0] == "1"
-        out = []
-        for l in lists:
-            extra = []
-            if with_sources:
-                for u in l["sources"]:
-                    try:
-                        with open(core.source_cache_file(u)) as f:
-                            extra += [x.strip() for x in f if x.strip()]
-                    except FileNotFoundError:
-                        pass
-            out.append(leechblock.sites_for_leechblock(l, extra))
-        self._send(200, "".join(out), "text/plain")
-
     def _blocked_page(self, q):
-        host = html.escape(q.get("host", [""])[0])
-        msg = html.escape(q.get("msg", [""])[0])
-        page = f"""<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Blocked</title><style>body{{font:16px system-ui;margin:15vh auto;max-width:32rem;padding:0 16px;
-color:#222;background:#fafafa}}h1{{font-size:1.6rem}}code{{background:#eee;padding:2px 4px}}
-@media (prefers-color-scheme:dark){{body{{background:#161616;color:#ddd}}code{{background:#333}}}}</style>
-<h1>Site blocked</h1><p><code>{host}</code> is blocked by LeechProxy.</p><p>{msg}</p>"""
+        host = q.get("host", [""])[0]
+        msg = q.get("msg", [""])[0]
+        # msg is "<list name> (<reason>)" as produced by the helper
+        name, _, reason = msg.rpartition(" (")
+        reason = reason.rstrip(")")
+        why = {
+            "limit": "You've used up today's time for this site.",
+            "period": "This site is blocked at this time of day.",
+            "always": "This site is blocked.",
+        }.get(reason, "This site is blocked.")
+        page = f"""<!doctype html><html lang="en"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Blocked</title>
+<style>
+:root{{--bg:#f6f6f4;--card:#fff;--fg:#1d1d1b;--muted:#6b6b66;--line:#e2e2dd;--accent:#b3261e}}
+@media (prefers-color-scheme:dark){{:root{{--bg:#141413;--card:#1e1e1c;--fg:#ebebe6;--muted:#9c9c95;--line:#33332f;--accent:#f2827a}}}}
+body{{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,sans-serif;
+  min-height:100vh;display:grid;place-items:center;padding:16px;box-sizing:border-box}}
+.card{{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:32px;max-width:28rem;width:100%}}
+.icon{{width:44px;height:44px;border-radius:50%;background:var(--accent);color:#fff;display:grid;place-items:center;
+  font-size:24px;font-weight:700;margin-bottom:16px}}
+h1{{font-size:1.5rem;margin:0 0 6px}} .host{{font-weight:600;overflow-wrap:anywhere}}
+p{{margin:8px 0}} .muted{{color:var(--muted);font-size:.9rem}}
+</style>
+<div class="card"><div class="icon">✕</div>
+<h1>Blocked</h1>
+<p><span class="host">{html.escape(host)}</span></p>
+<p>{html.escape(why)}</p>
+{f'<p class="muted">Rule: {html.escape(name or msg)}</p>' if msg else ''}
+</div></html>"""
         self._send(200, page, "text/html")
 
 

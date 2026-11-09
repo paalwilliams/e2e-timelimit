@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TMP = tempfile.mkdtemp()
 os.environ["LEECHPROXY_DATA"] = TMP
 
-from leechproxy import acl_helper, core, leechblock, webui  # noqa: E402
+from leechproxy import acl_helper, core, webui  # noqa: E402
 
 MON_10 = dt.datetime(2026, 11, 9, 10, 0)  # a Monday
 
@@ -19,7 +19,7 @@ MON_10 = dt.datetime(2026, 11, 9, 10, 0)  # a Monday
 def setup_lists(*lists, users=()):
     core.save_config({"lists": list(lists), "users": list(users)})
     with core.db() as c:
-        for t in ("usage2", "hosts2", "lbreports", "devices"):
+        for t in ("usage2", "hosts2", "devices"):
             c.execute(f"DELETE FROM {t}")
 
 
@@ -58,21 +58,6 @@ class EngineTest(unittest.TestCase):
         self.assertFalse(e.check("youtube.com", MON_10.replace(minute=1))[0])
         blocked, name, reason = e.check("youtube.com", MON_10.replace(minute=2))
         self.assertEqual((blocked, reason), (True, "limit"))
-
-    def test_leechblock_report_counts(self):
-        setup_lists({"name": "yt", "domains": ["youtube.com"], "limit_minutes": 30, "leechblock_set": 2},
-                    users=[{"id": "kid", "name": "Kid", "devices": [{"ip": "10.0.0.5"}, {"ip": "10.0.0.6"}]}])
-        e = core.Engine()
-        kid = dict(ip="10.0.0.5")
-        midnight = dt.datetime.combine(MON_10.date(), dt.time()).timestamp()
-        core.record_leechblock_report("10.0.0.5", {"sets": [{"set": 2, "periodStart": midnight, "periodSecs": 1500}]}, MON_10)
-        self.assertFalse(e.check("youtube.com", MON_10, **kid)[0])
-        core.record_leechblock_report("10.0.0.6", {"sets": [{"set": 2, "periodStart": midnight, "periodSecs": 400}]}, MON_10)
-        self.assertEqual(e.check("youtube.com", MON_10, **kid)[2], "limit")  # 25 + 6 min across the kid's two browsers
-        self.assertFalse(e.check("youtube.com", MON_10, ip="10.0.0.99")[0])  # someone else isn't affected
-        # A stale period (yesterday) doesn't count
-        core.record_leechblock_report("10.0.0.6", {"sets": [{"set": 2, "periodStart": midnight - 86400, "periodSecs": 9999}]}, MON_10)
-        self.assertFalse(e.check("youtube.com", MON_10, **kid)[0])
 
     def test_reload_on_change(self):
         setup_lists({"name": "a", "domains": ["a.com"]})
@@ -147,49 +132,6 @@ class HelperTest(unittest.TestCase):
         self.assertEqual({d["mac"] for d in core.recent_devices()}, {mac, None})
 
 
-class LeechBlockImportTest(unittest.TestCase):
-    EXPORT = "\n".join([
-        "numSets=3",
-        "setName1=Social%20media",
-        "sites1=+old.reddit.com facebook.com reddit.com twitter.com/home ~cats",
-        "times1=0900-1700",
-        "limitMins1=30",
-        "limitPeriod1=86400",
-        "days1=62",            # Mon-Fri
-        "conjMode1=false",
-        "sites2=",
-        "setName3=",
-        "sites3=youtube.com",
-        "limitMins3=",
-        "days3=127",
-    ])
-
-    def test_import(self):
-        lists, warnings = leechblock.import_options(self.EXPORT)
-        self.assertEqual(len(lists), 2)
-        a, b = lists
-        self.assertEqual(a["name"], "Social media")
-        self.assertEqual(sorted(a["domains"]), ["facebook.com", "reddit.com"])
-        self.assertEqual(a["allow"], ["old.reddit.com"])
-        self.assertEqual(a["periods"], ["0900-1700"])
-        self.assertEqual(a["limit_minutes"], 30)
-        self.assertEqual(a["days"], ["mon", "tue", "wed", "thu", "fri"])
-        self.assertEqual(a["leechblock_set"], 1)
-        self.assertTrue(any("twitter.com/home" in w for w in warnings))
-        self.assertEqual(b["name"], "LeechBlock set 3")
-        self.assertEqual(b["days"], core.DAYS)
-        core.validate_list(a); core.validate_list(b)
-
-    def test_json_export(self):
-        js = json.dumps({"numSets": "1", "sites1": "x.com", "days1": [True] * 7, "setName1": "X"})
-        lists, _ = leechblock.import_options(js)
-        self.assertEqual(lists[0]["domains"], ["x.com"])
-
-    def test_sites_output(self):
-        txt = leechblock.sites_for_leechblock({"domains": ["b.com", "a.com"], "allow": ["x.a.com"]}, ["c.com"])
-        self.assertEqual(txt, "a.com\nb.com\nc.com\n+x.a.com\n")
-
-
 class WebTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -209,7 +151,7 @@ class WebTest(unittest.TestCase):
             out = resp.read().decode()
             return json.loads(out) if ct.startswith("application/json") else out
 
-    def test_crud_import_and_sites(self):
+    def test_crud(self):
         setup_lists()
         l = self.req("POST", "/api/lists", {"name": "Test", "domains": ["a.com"]})["list"]
         st = self.req("GET", "/api/state")
@@ -219,21 +161,16 @@ class WebTest(unittest.TestCase):
         st = self.req("GET", "/api/state")
         self.assertEqual([x["label"] for x in st["lists"][0]["status"]], ["Kid"])
         self.assertEqual(len(st["users"][0]["devices"]), 2)
-        self.req("PUT", f"/api/lists/{l['id']}", {"name": "Test2", "domains": ["a.com", "b.com"], "leechblock_set": 4})
-        self.assertEqual(self.req("GET", f"/leechblock/sites/{l['id']}"), "a.com\nb.com\n")
-        self.assertEqual(self.req("GET", "/leechblock/set/4"), "a.com\nb.com\n")
-        r = self.req("POST", "/api/import/leechblock", LeechBlockImportTest.EXPORT, raw=True)
-        self.assertEqual(r["imported"], 2)
-        r = self.req("POST", "/api/import/leechblock", LeechBlockImportTest.EXPORT, raw=True)  # re-import replaces
-        self.assertEqual(len(r["lists"]), 3)
-        self.req("POST", "/api/leechblock/report", {"sets": [{"set": 1, "periodStart": 0, "periodSecs": 5}]})
-        self.assertEqual(len(self.req("GET", "/api/state")["leechblock_reports"]), 1)
+        r = self.req("PUT", f"/api/lists/{l['id']}", {"name": "Test2", "domains": ["a.com", "b.com"]})
+        self.assertEqual(r["list"]["domains"], ["a.com", "b.com"])
         self.req("DELETE", f"/api/lists/{l['id']}")
         self.req("DELETE", f"/api/users/{u['id']}")
         self.assertEqual(self.req("GET", "/api/state")["users"], [])
-        self.assertEqual(len(self.req("GET", "/api/state")["lists"]), 2)
+        self.assertEqual(len(self.req("GET", "/api/state")["lists"]), 0)
         self.assertIn("<title>LeechProxy</title>", self.req("GET", "/"))
-        self.assertIn("&lt;x&gt;", self.req("GET", "/blocked?host=%3Cx%3E"))
+        page = self.req("GET", "/blocked?host=%3Cx%3E&msg=Video%20(limit)")
+        self.assertIn("&lt;x&gt;", page)
+        self.assertIn("used up today", page)
 
 
 if __name__ == "__main__":
